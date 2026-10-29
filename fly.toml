@@ -1,33 +1,30 @@
-# fly.toml app configuration file generated for bis-newcrm-backend on 2026-10-29T10:51:02Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
-app = 'bis-newcrm-backend'
-primary_region = 'ams'
+app = "bis-newcrm-api"
+primary_region = "fra"
 
 [build]
 
-[processes]
-  app = 'node ./dbsetup.js ./start.sh'
+[env]
+  PORT = "3000"
+  APP_TIMEZONE = "Asia/Tashkent"
 
-[[mounts]]
-  source = 'data'
-  destination = '/data'
-  auto_extend_size_threshold = 80
-  auto_extend_size_increment = '1GB'
-  auto_extend_size_limit = '10GB'
+[mounts]
+  source = "data"
+  destination = "/data"
 
 [http_service]
-  internal_port = 8080
+  internal_port = 3000
   force_https = true
-  auto_stop_machines = 'stop'
+  auto_stop_machines = "stop"
   auto_start_machines = true
   min_machines_running = 0
-  processes = ['app']
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
 
 [[vm]]
-  memory = '1gb'
-  cpu_kind = 'shared'
-  cpus = 1
-  memory_mb = 256
+  size = "shared-cpu-1x"
+  memory = "256mb"
