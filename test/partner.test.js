@@ -962,7 +962,7 @@ test('partner api: router exposes exactly the expected routes', async () => {
 // ---------- Task 8: reports and end-to-end ----------
 test('reports: saygak delivered money shows in debtors, summary and shrinks with lump payments', async () => {
   const { client, token } = await makePartner('Report Saygak', '+998905000001', 'reportSay');
-  const day = '2026-08-15'; // a day no other test delivers on
+  const day = `${prevMonth}-27`; // a past day (previous month) no other test delivers on
   const summary = async () => (await call('GET', `/api/reports/summary?from=${day}&to=${day}`, { token: admin })).body;
   const debtors = async () => (await call('GET', '/api/reports/debtors', { token: operator })).body.data;
   const before = await summary();

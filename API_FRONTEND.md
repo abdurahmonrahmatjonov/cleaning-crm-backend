@@ -17,13 +17,13 @@ The server sleeps when idle, so the first request after a pause can take a few s
 
 ### Errors
 
-Every error is `{ "error": "message", "details": [...] }`. `details` appears only on `400`.
+Every error is `{ "error": "message", "details": ... }`. `details` appears only on `400`, in one of two shapes. Validation errors from request schemas carry `details` as an **array** of `{ path, message }`. Errors thrown by a handler carry `details` as a plain **object**; in this feature: `{ "path": "paidDate" }`, `{ "path": "prices" }`, `{ "lineId": 12 }` (sizes sent for a line that is not kv.m) and `{ "path": "paid" }` or `{ "path": "discount" }` (money sent when handing a saygak order over). Many handler 400s have no `details` at all.
 
 | Code | Meaning |
 |---|---|
 | 400 | Validation failed. `details` is `[{ "path": "lines.0.price", "message": "..." }]`, so you can show the message next to the field |
 | 401 | Missing, wrong or expired token, or wrong username/password |
-| 403 | Your role is not allowed to do this. A saygak (partner) token gets `403` on every route except `/api/partner/*` and `/api/auth/*` |
+| 403 | Your role is not allowed to do this. A saygak (partner) token gets `403` on every route except `/api/partner/*`, `/api/auth/*` (login, me) and the public `GET /api/branding` (`/health` is also open) |
 | 404 | Not found |
 | 409 | Wrong status for this action, or a duplicate (for example the order was already picked up) |
 | 429 | Too many login attempts (10 per 15 minutes). Ask the user to wait |
@@ -163,7 +163,7 @@ Returns:
 ```json
 { "token": "eyJ...", "user": { "id": 1, "username": "admin", "fullName": "Administrator", "role": "admin", "roleName": "Admin", "permissions": ["orders.view", "..."], "clientId": null } }
 ```
-`clientId` is `null` for staff. A **saygak** login has `role: "saygak"`, `permissions: []` and `clientId` set to their client id. When `clientId` is not `null`, show the saygak portal (only `/api/partner/*` works for that token; every other route gives `403`).
+`clientId` is `null` for staff. A **saygak** login has `role: "saygak"`, `permissions: []` and `clientId` set to their client id. When `clientId` is not `null`, show the saygak portal (only `/api/partner/*`, `/api/auth/*` and the public `GET /api/branding` work for that token; every other route gives `403`).
 
 ### GET /auth/me
 Returns the current user: `{ id, username, fullName, role, roleName, permissions, clientId }` (`clientId` is `null` for staff). Use it to restore the session on page load.
@@ -225,7 +225,7 @@ All four list routes accept `?page=`, `?limit=` and `?search=` (matches client n
 - `lines` needs 1 to 50 items. `serviceId` comes from `GET /services`.
 - Returns `201` with the full order. The backend fills in `docNum`, status, `createdBy`, timestamps and zeroed totals.
 - You can send `clientId` of an existing client instead of `clientName` + `clientPhone`.
-- **Saygak (partner) clients:** if the client (found by `clientId` or by phone) has `isPartner`, the order is created as `kind: "partner"`. Then `location`, `landmark` and `pickupTime` are optional and ignored, and each line's `price` is ignored: the server uses the client's saved prices (`/clients/:id/prices`). A service without a saved price gives `400` (`details[].path` is `lines.N.serviceId`). Lines may carry `expectedQuantity` (1 to 100000). At most 10 open (`Zakaz Qabul qilindi`) orders per saygak, the 11th gives `409`.
+- **Saygak (partner) clients:** if the client (found by `clientId` or by phone) has `isPartner`, the order is created as `kind: "partner"`. Then omit `location`, `landmark` and `pickupTime` (they are not needed; if you do send them they are still validated, so `pickupTime: ""` or `location: null` gives `400`), and each line's `price` is ignored: the server uses the client's saved prices (`/clients/:id/prices`). A service without a saved price gives `400` (`details` is the object `{ "path": "lines.N.serviceId" }`, not an array). Lines may carry `expectedQuantity` (1 to 100000). At most 10 open (`Zakaz Qabul qilindi`) orders per saygak, the 11th gives `409`.
 - For regular clients `location`, `pickupTime` and every line's `price` are required (`400` otherwise).
 
 ### PATCH /orders/:docNum/pickup
@@ -239,7 +239,7 @@ The body must list **every** line of the order exactly once. Otherwise you get `
 ```
 `lines[].id` is the **line id** from the order's `lines`, not the `serviceId`. `quantity` is a whole number from 1.
 
-For `kind: "partner"` orders `waybillNumber` and `deliveryTime` are optional (they are stored as `""` when omitted). For regular orders they are required.
+For `kind: "partner"` orders `waybillNumber` and `deliveryTime` are optional (they are stored as `""` when omitted). Omit the keys; do not send empty strings (`waybillNumber: ""` and `deliveryTime: ""` give `400`). For regular orders they are required.
 
 ### PATCH /orders/:docNum/deliver
 Again, list every line once.
@@ -383,8 +383,10 @@ Un-flagging (`isPartner: false`) is refused with `409` while the saygak has an a
 | GET | `/clients/:id/prices` | Any staff with `clients.view`. `{ data: [{ serviceId, serviceName, unit, price }] }` for every active service; `price` is `null` when not set |
 | PUT | `/clients/:id/prices` | Admin. `{ prices: [{ serviceId, price }] }` (price 0 to 1e9, no duplicate service, at most 500). **Replaces** the whole list: services not sent lose their price. Inactive/unknown service gives `400`. `409` if the client is not a saygak. Returns the same shape as GET |
 | GET | `/clients/:id/login` | Admin. `{ username, isActive }` or `null` when the client has no login |
-| PUT | `/clients/:id/login` | Admin. `{ username, fullName?, password }` creates the login, or resets username and password of the existing one. Password at least 8 characters. `409` for a duplicate username or a client that is not a saygak. Returns `{ username, isActive }` |
+| PUT | `/clients/:id/login` | Admin. `{ username, fullName?, password }` creates the login, or resets username and password of the existing one. `username` is 3 to 50 characters: letters, digits and `_ . -`. `password` is 8 to 100 characters. `409` for a duplicate username or a client that is not a saygak. Returns `{ username, isActive }` |
 | PATCH | `/clients/:id/login` | Admin. `{ isActive }`. `404` if there is no login. A deactivated saygak's token stops working at once (`401`). Returns `{ username, isActive }` |
+
+The bodies of `PUT /clients/:id/login`, `PUT /clients/:id/prices`, `PATCH /clients/:id/login` and `POST /clients/:id/payments` are strict: an unknown key gives `400`.
 
 One login per saygak. Saygak users do not appear in `/users`, and the `saygak` role cannot be edited or assigned there.
 
@@ -423,7 +425,7 @@ Statement (same shape for staff and for the saygak's own `/api/partner/statement
 
 ## Saygak portal API (`/api/partner/*`)
 
-For a logged-in saygak only (token whose user has `clientId`). Staff tokens get `403` here, and a saygak token gets `403` everywhere else. The saygak is always identified by the token: any `clientId` in the body or query is ignored. An order of another client or a regular order gives `404` on every `:docNum` route. A deactivated login gets `401`.
+For a logged-in saygak only (token whose user has `clientId`). Staff tokens get `403` here, and a saygak token gets `403` on every other route except `/api/auth/*` (login, me) and the public `GET /api/branding`. The saygak is always identified by the token: any `clientId` in the body or query is ignored. An order of another client or a regular order gives `404` on every `:docNum` route. A deactivated login gets `401`.
 
 | Method | Path | Notes |
 |---|---|---|
