@@ -136,6 +136,13 @@ export function clientsRouter(db) {
     if (b.isPartner === false && before.isPartner && db.prepare('SELECT 1 FROM users WHERE clientId = ? AND isActive = 1').get(id)) {
       throw conflict('Deactivate the saygak login first');
     }
+    if (b.isPartner === false && before.isPartner) {
+      const owing = db
+        .prepare(`SELECT docTotal, discount, paid FROM orders WHERE clientId = ? AND kind = 'partner' AND status = ?`)
+        .all(id, ORDER_STATUS.DELIVERED)
+        .some((o) => round2(o.docTotal - o.discount - o.paid) > 0);
+      if (owing) throw conflict('Settle the saygak debt first');
+    }
     const next = { name: b.name ?? before.name, phone: b.phone ?? before.phone, isPartner: b.isPartner === undefined ? before.isPartner : b.isPartner ? 1 : 0 };
     try {
       db.transaction(() => {
@@ -236,6 +243,7 @@ export function clientsRouter(db) {
     const amount = round2(req.valid.body.amount);
     const discount = round2(req.valid.body.discount);
     const date = req.valid.body.paidDate ?? today();
+    if (date > today()) throw badRequest('paidDate cannot be in the future', { path: 'paidDate' });
     getPartner(id);
     if (discount > 0 && !req.user.permissions.includes('orders.discount')) throw new HttpError(403, 'You are not allowed to give discounts');
     const result = db.transaction(() => {

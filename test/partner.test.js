@@ -692,3 +692,36 @@ test('statement: opening from earlier months, month validation, in-progress with
   assert.equal(s.closing, debtOf(client.id));
   assert.equal((await stmt(client.id, MONTH, partnerA)).status, 403);
 });
+
+test('lump payment: future paidDate is rejected with no writes; past date keeps the invariant', async () => {
+  const { client } = await makePartner('Lump Future', '+998903000020', 'lumpFut');
+  const o = seedDelivered(client.id, 100000, D(1));
+  const batches = () => db.prepare('SELECT COUNT(*) n FROM payment_batches WHERE clientId = ?').get(client.id).n;
+  const nextYear = `${Number(MONTH.slice(0, 4)) + 1}-01-15`;
+  const bad = await pay(client.id, { amount: 10000, paidDate: nextYear });
+  assert.equal(bad.status, 400);
+  assert.match(bad.body.error ?? bad.body.message ?? JSON.stringify(bad.body), /future/);
+  assert.equal(ord(o).paid, 0);
+  assert.equal(batches(), 0);
+  // past date in an earlier month is allowed
+  const ok = await pay(client.id, { amount: 10000, paidDate: `${prevMonth}-10` });
+  assert.equal(ok.status, 201);
+  assert.equal(batches(), 1);
+  assert.equal((await stmt(client.id, prevMonth)).body.credits, 10000);
+  const cur = (await stmt(client.id)).body;
+  assert.equal(cur.closing, debtOf(client.id));
+  // today itself is allowed
+  assert.equal((await pay(client.id, { amount: 1000, paidDate: todayStr() })).status, 201);
+});
+
+test('un-flagging a saygak is blocked while partner debt remains', async () => {
+  const { client } = await makePartner('Saygak Debt Unflag', '+998903000021', 'debtUnflag');
+  seedDelivered(client.id, 50000, D(1));
+  const unflag = () => call('PATCH', `/api/clients/${client.id}`, { token: operator, body: { isPartner: false } });
+  assert.equal((await call('PATCH', `/api/clients/${client.id}/login`, { token: admin, body: { isActive: false } })).status, 200);
+  assert.equal((await unflag()).status, 409);
+  assert.equal(db.prepare('SELECT isPartner FROM clients WHERE id = ?').get(client.id).isPartner, 1);
+  assert.equal((await pay(client.id, { amount: 50000 })).status, 201);
+  assert.equal((await unflag()).status, 200);
+  assert.equal(db.prepare('SELECT isPartner FROM clients WHERE id = ?').get(client.id).isPartner, 0);
+});
