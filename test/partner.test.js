@@ -958,3 +958,70 @@ test('partner api: router exposes exactly the expected routes', async () => {
   const want = ['GET /me', 'GET /services', 'GET /orders', 'POST /orders', 'GET /orders/:docNum', 'PATCH /orders/:docNum', 'POST /orders/:docNum/cancel', 'GET /statement'].sort();
   assert.deepEqual(got, want);
 });
+
+// ---------- Task 8: reports and end-to-end ----------
+test('reports: saygak delivered money shows in debtors, summary and shrinks with lump payments', async () => {
+  const { client, token } = await makePartner('Report Saygak', '+998905000001', 'reportSay');
+  const day = '2026-08-15'; // a day no other test delivers on
+  const summary = async () => (await call('GET', `/api/reports/summary?from=${day}&to=${day}`, { token: admin })).body;
+  const debtors = async () => (await call('GET', '/api/reports/debtors', { token: operator })).body.data;
+  const before = await summary();
+  const o = (await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).body;
+  const id = await staffWalk(o.docNum, 'pack');
+  const del = await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body: { deliveredDate: day, lines: [{ id, sqm: 20 }] } });
+  assert.equal(del.status, 200);
+  assert.equal(del.body.docTotal, 120000); // 20 kv.m x 6000
+
+  assert.equal((await debtors()).find((d) => d.clientId === client.id).debt, 120000);
+  let s = await summary();
+  assert.equal(s.sales.total - before.sales.total, 120000);
+  assert.equal(s.outstandingDebt - before.outstandingDebt, 120000);
+  assert.equal(s.collected, before.collected); // nothing paid yet
+
+  assert.equal((await pay(client.id, { amount: 50000 })).status, 201);
+  assert.equal((await debtors()).find((d) => d.clientId === client.id).debt, 70000);
+  s = await summary();
+  assert.equal(s.outstandingDebt - before.outstandingDebt, 70000);
+
+  assert.equal((await pay(client.id, { amount: 70000, paidDate: day })).status, 201);
+  assert.equal((await debtors()).find((d) => d.clientId === client.id), undefined);
+  s = await summary();
+  assert.equal(s.outstandingDebt, before.outstandingDebt);
+  assert.equal(s.collected - before.collected, 70000); // only the payment dated inside the range
+});
+
+test('end to end: saygak from setup to settled statement and back via reversal', async () => {
+  const { client, token } = await makePartner('E2E Saygak', '+998905000002', 'e2eSay', [{ serviceId: 1, price: 5000 }]);
+  assert.equal((await call('GET', '/api/auth/me', { token })).body.clientId, client.id);
+
+  const o = (await P('POST', '/orders', token, { lines: [{ serviceId: 1, expectedQuantity: 3 }] })).body;
+  assert.equal(o.status, 'Zakaz Qabul qilindi');
+  assert.equal(o.lines[0].price, undefined); // no amounts before handover
+  const id = o.lines[0].id;
+
+  const step = async (name, who, body) => assert.equal((await call('PATCH', `/api/orders/${o.docNum}/${name}`, { token: who, body })).status, 200, name);
+  await step('pickup', driver, { lines: [{ id, quantity: 3 }] }); // no waybill / delivery time
+  await step('wash', packer, { lines: [{ id, quantity: 3, sizes: [{ width: 2, length: 3 }, { width: 3, length: 3 }] }] });
+  const packed = await call('PATCH', `/api/orders/${o.docNum}/pack`, { token: packer, body: { lines: [{ id, quantity: 3, sizes: [{ width: 2.5, length: 4 }, { width: 3, length: 3 }] }] } });
+  assert.equal(packed.body.lines[0].sizesTotal, 19);
+  await step('deliver', admin, { lines: [{ id, sqm: packed.body.lines[0].sizesTotal }] });
+
+  const seen = (await P('GET', `/orders/${o.docNum}`, token)).body;
+  assert.equal(seen.docTotal, 95000); // 19 x 5000
+  assert.equal(seen.debt, 95000);
+  assert.equal(seen.lines[0].sqm, 19);
+
+  assert.equal((await pay(client.id, { amount: 30000 })).status, 201);
+  const batch = (await pay(client.id, { amount: 15000 })).body.batchId;
+  const me = (await P('GET', '/me', token)).body;
+  const st = (await P('GET', '/statement', token)).body;
+  const staffSt = (await stmt(client.id)).body;
+  assert.equal(me.debt, 50000);
+  assert.equal(st.closing, 50000);
+  assert.deepEqual(st, staffSt);
+  assert.equal((await P('GET', `/orders/${o.docNum}`, token)).body.paid, 45000);
+
+  assert.equal((await call('DELETE', `/api/clients/${client.id}/payments/${batch}`, { token: admin })).status, 200);
+  assert.equal((await P('GET', '/me', token)).body.debt, 65000);
+  assert.equal((await P('GET', '/statement', token)).body.closing, 65000);
+});
