@@ -246,3 +246,24 @@ test('migration fix-up locks a pre-existing custom saygak role', () => {
   d2.close();
   for (const f of [path, `${path}-wal`, `${path}-shm`]) { try { process.getBuiltinModule('fs').unlinkSync(f); } catch {} }
 });
+
+test('un-flagging a saygak is blocked while the login is active', async () => {
+  const { client } = await makePartner('Saygak Unflag', '+998902222231', 'unflagP');
+  const unflag = () => call('PATCH', `/api/clients/${client.id}`, { token: operator, body: { isPartner: false } });
+  assert.equal((await unflag()).status, 409);
+  assert.equal(db.prepare('SELECT isPartner FROM clients WHERE id = ?').get(client.id).isPartner, 1);
+  assert.equal((await call('PATCH', `/api/clients/${client.id}/login`, { token: admin, body: { isActive: false } })).status, 200);
+  assert.equal((await unflag()).status, 200);
+  assert.equal(db.prepare('SELECT isPartner FROM clients WHERE id = ?').get(client.id).isPartner, 0);
+  // a partner with no login can be un-flagged
+  const c = (await call('POST', '/api/clients', { token: operator, body: { name: 'Saygak NoLogin', phone: '+998902222232' } })).body;
+  assert.equal((await call('PATCH', `/api/clients/${c.id}`, { token: operator, body: { isPartner: true } })).status, 200);
+  assert.equal((await call('PATCH', `/api/clients/${c.id}`, { token: operator, body: { isPartner: false } })).status, 200);
+});
+
+test('prices reject an inactive service', async () => {
+  const svc = (await call('POST', '/api/services', { token: admin, body: { name: 'Inactive price svc', unit: 'metr' } })).body;
+  assert.equal((await call('PATCH', `/api/services/${svc.id}`, { token: admin, body: { isActive: false } })).status, 200);
+  const r = await call('PUT', `/api/clients/${clientA}/prices`, { token: admin, body: { prices: [{ serviceId: 1, price: 6000 }, { serviceId: svc.id, price: 1000 }] } });
+  assert.equal(r.status, 400);
+});

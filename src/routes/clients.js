@@ -122,6 +122,9 @@ export function clientsRouter(db) {
     const { id } = req.valid.params;
     const before = getClient(id);
     const b = req.valid.body;
+    if (b.isPartner === false && before.isPartner && db.prepare('SELECT 1 FROM users WHERE clientId = ? AND isActive = 1').get(id)) {
+      throw conflict('Deactivate the saygak login first');
+    }
     const next = { name: b.name ?? before.name, phone: b.phone ?? before.phone, isPartner: b.isPartner === undefined ? before.isPartner : b.isPartner ? 1 : 0 };
     try {
       db.transaction(() => {
@@ -158,7 +161,8 @@ export function clientsRouter(db) {
     const { id } = req.valid.params;
     getPartner(id);
     const next = req.valid.body.prices;
-    for (const p of next) if (!db.prepare('SELECT 1 FROM services WHERE id = ?').get(p.serviceId)) throw badRequest('Unknown service', { path: 'prices' });
+    const activeSvc = db.prepare('SELECT 1 FROM services WHERE id = ? AND isActive = 1');
+    for (const p of next) if (!activeSvc.get(p.serviceId)) throw badRequest('Unknown or inactive service', { path: 'prices' });
     db.transaction(() => {
       const old = new Map(db.prepare('SELECT serviceId, price FROM client_prices WHERE clientId = ?').all(id).map((r) => [r.serviceId, r.price]));
       db.prepare('DELETE FROM client_prices WHERE clientId = ?').run(id);
