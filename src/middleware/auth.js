@@ -42,3 +42,11 @@ export const requireRole = (...roles) => (req, _res, next) =>
 /** Allow if the user has at least one of these permissions. */
 export const requirePerm = (...perms) => (req, _res, next) =>
   perms.some((p) => req.user.permissions.includes(p)) ? next() : next(new HttpError(403, 'Forbidden for your role'));
+
+/** Deny-by-default: any account tied to a client (saygak) is barred from staff routes. */
+export const partnerGate = (req, _res, next) =>
+  req.user?.clientId ? next(new HttpError(403, 'Forbidden for your role')) : next();
+
+/** The partner API is only for accounts tied to a client. */
+export const requirePartner = (req, _res, next) =>
+  req.user?.clientId ? next() : next(new HttpError(403, 'Forbidden for your role'));

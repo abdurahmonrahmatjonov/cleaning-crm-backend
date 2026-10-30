@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 process.env.JWT_SECRET = 'test-secret';
 const { openDb, seed } = await import('../src/db.js');
-const { createApp } = await import('../src/app.js');
+const { createApp, STAFF_MOUNTS } = await import('../src/app.js');
 
 let server, base, db;
 let admin, operator, driver, packer;
@@ -266,4 +266,39 @@ test('prices reject an inactive service', async () => {
   assert.equal((await call('PATCH', `/api/services/${svc.id}`, { token: admin, body: { isActive: false } })).status, 200);
   const r = await call('PUT', `/api/clients/${clientA}/prices`, { token: admin, body: { prices: [{ serviceId: 1, price: 6000 }, { serviceId: svc.id, price: 1000 }] } });
   assert.equal(r.status, 400);
+});
+
+test('access gate: saygak denied on every staff mount; staff denied on /partner', async () => {
+  assert.ok(Array.isArray(STAFF_MOUNTS));
+  assert.ok(STAFF_MOUNTS.length >= 11);
+  for (const m of ['users', 'roles', 'chat', 'activity', 'comments', 'services', 'expense-types', 'orders', 'expenses', 'clients', 'reports']) {
+    assert.ok(STAFF_MOUNTS.includes(`/api/${m}`), m);
+  }
+  assert.ok(!STAFF_MOUNTS.includes('/api/auth') && !STAFF_MOUNTS.includes('/api/branding') && !STAFF_MOUNTS.includes('/api/partner'));
+  for (const m of STAFF_MOUNTS) {
+    assert.equal((await call('GET', m, { token: partnerA })).status, 403, m);
+    assert.equal((await call('GET', m)).status, 401, `${m} unauthenticated`);
+  }
+  for (const p of ['/api/services', '/api/chat/global', '/api/orders/received', '/api/comments', '/api/clients', '/api/reports/summary', '/api/activity', '/api/users', '/api/roles', '/api/expenses', '/api/expense-types']) {
+    assert.equal((await call('GET', p, { token: partnerA })).status, 403, p);
+  }
+  const ping = await call('GET', '/api/partner/ping', { token: partnerA });
+  assert.equal(ping.status, 200);
+  assert.deepEqual(ping.body, { ok: true });
+  for (const t of [admin, operator, driver, packer]) assert.equal((await call('GET', '/api/partner/ping', { token: t })).status, 403);
+  assert.equal((await call('GET', '/api/partner/ping')).status, 401);
+  assert.equal((await call('GET', '/api/auth/me', { token: partnerA })).status, 200);
+  assert.equal((await call('GET', '/api/branding', { token: partnerA })).status, 200);
+  // creating another app must not duplicate mounts
+  const n = STAFF_MOUNTS.length;
+  createApp(db, { loginLimit: 1000 });
+  assert.equal(STAFF_MOUNTS.length, n);
+});
+
+test('access gate: deactivated saygak gets 401, not 403', async () => {
+  const { client, token } = await makePartner('Saygak Gate', '+998902222241', 'gateP');
+  assert.equal((await call('GET', '/api/partner/ping', { token })).status, 200);
+  assert.equal((await call('PATCH', `/api/clients/${client.id}/login`, { token: admin, body: { isActive: false } })).status, 200);
+  assert.equal((await call('GET', '/api/partner/ping', { token })).status, 401);
+  assert.equal((await call('GET', '/api/services', { token })).status, 401);
 });
