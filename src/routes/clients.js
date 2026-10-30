@@ -121,7 +121,7 @@ export function clientsRouter(db) {
     if (!client) throw notFound('Client not found');
     const orders = db
       .prepare(
-        `SELECT docNum, status, docTotal, discount, paid, createdAt, deliveredDate FROM orders
+        `SELECT docNum, kind, status, docTotal, discount, paid, createdAt, deliveredDate FROM orders
          WHERE clientId = ? ORDER BY docNum DESC`,
       )
       .all(id);

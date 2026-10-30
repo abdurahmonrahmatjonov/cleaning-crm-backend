@@ -366,7 +366,7 @@ Query: `?from=YYYY-MM-DD&to=YYYY-MM-DD&expenseTypeId=&page=&limit=`. Returns `da
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/clients?search=&page=&limit=` | `{ id, name, phone, isPartner, createdAt, ordersCount, debt }` per client. `isPartner` is `0` or `1` |
-| GET | `/clients/:id` | The same fields plus `orders: [{ docNum, status, docTotal, paid, createdAt, deliveredDate }]` |
+| GET | `/clients/:id` | The same fields plus `orders: [{ docNum, kind, status, docTotal, paid, createdAt, deliveredDate }]` (`kind` is `regular` or `partner`) |
 
 Clients are also created automatically when an order is created (see `POST /clients` above for creating one by hand).
 

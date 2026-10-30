@@ -1025,3 +1025,17 @@ test('end to end: saygak from setup to settled statement and back via reversal',
   assert.equal((await P('GET', '/me', token)).body.debt, 65000);
   assert.equal((await P('GET', '/statement', token)).body.closing, 65000);
 });
+
+test('client detail: orders carry kind (regular before flagging, partner after)', async () => {
+  const c = (await call('POST', '/api/clients', { token: operator, body: { name: 'Late Saygak', phone: '+998902222299' } })).body;
+  const reg = await call('POST', '/api/orders', { token: operator, body: newOrder({ clientId: c.id }) });
+  assert.equal(reg.status, 201);
+  assert.equal((await call('PATCH', `/api/clients/${c.id}`, { token: operator, body: { isPartner: true } })).status, 200);
+  assert.equal((await call('PUT', `/api/clients/${c.id}/prices`, { token: admin, body: { prices: [{ serviceId: 1, price: 6000 }] } })).status, 200);
+  const par = await partnerOrder(c.id);
+  assert.equal(par.status, 201);
+  const d = (await call('GET', `/api/clients/${c.id}`, { token: operator })).body;
+  const kindOf = (n) => d.orders.find((o) => o.docNum === n).kind;
+  assert.equal(kindOf(reg.body.docNum), 'regular');
+  assert.equal(kindOf(par.body.docNum), 'partner');
+});
