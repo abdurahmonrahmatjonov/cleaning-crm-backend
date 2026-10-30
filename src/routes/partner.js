@@ -5,13 +5,14 @@ import { ORDER_STATUS } from '../db.js';
 import { conflict, notFound, badRequest } from '../utils/httpError.js';
 import { id as idSchema, pagination } from '../utils/schemas.js';
 import { today, nowDateTime } from '../utils/time.js';
-import { logActivity } from '../utils/activity.js';
+import { logActivity, diff } from '../utils/activity.js';
 import { createPartnerOrder } from './orders.js';
 import { buildStatement, MONTH_RE } from '../utils/statement.js';
-import { priceMap } from '../utils/partner.js';
+import { priceMap, PARTNER_OPEN_ORDER_CAP } from '../utils/partner.js';
 import { loadSizes, round2, sizesTotal } from '../utils/sizes.js';
 
 const qty = z.number().int().min(1).max(100000);
+const editQty = z.number().int().min(0).max(100000); // 0 = clear ("not given")
 const createSchema = z
   .object({
     lines: z
@@ -22,13 +23,16 @@ const createSchema = z
   .strip()
   .refine((o) => new Set(o.lines.map((l) => l.serviceId)).size === o.lines.length, 'Each service may appear only once');
 const editSchema = z
-  .object({ lines: z.array(z.object({ id: idSchema, expectedQuantity: qty }).strip()).min(1).max(20) })
+  .object({ lines: z.array(z.object({ id: idSchema, expectedQuantity: editQty }).strip()).min(1).max(20) })
   .strip()
   .refine((o) => new Set(o.lines.map((l) => l.id)).size === o.lines.length, 'Duplicate line ids');
 const cancelSchema = z.object({ reason: z.string().trim().min(1).max(300) }).strip();
 const listQuery = pagination.extend({ status: z.enum(Object.values(ORDER_STATUS)).optional() });
 const params = z.object({ docNum: idSchema });
 const statementQuery = z.object({ month: z.string().regex(MONTH_RE, 'Expected YYYY-MM').optional() });
+
+/** What a delivered order still owes, never negative (overpaying one order does not offset another). */
+const orderDebt = (o) => Math.max(round2(o.docTotal - o.discount - o.paid), 0);
 
 /**
  * The saygak's view of an order. Built field by field (never spread a DB row) so that staff-only data
@@ -66,7 +70,7 @@ export function presentPartnerOrder(o, lines, sizeMap) {
     out.docTotal = o.docTotal;
     out.discount = o.discount;
     out.paid = o.paid;
-    out.debt = Math.max(round2(o.docTotal - o.discount - o.paid), 0);
+    out.debt = orderDebt(o);
   }
   return out;
 }
@@ -90,14 +94,17 @@ export function partnerRouter(db) {
     const cid = req.user.clientId;
     const c = getClient.get(cid);
     if (!c) throw notFound('Client not found');
-    const openOrders = db
+    const inProgressOrders = db
       .prepare("SELECT COUNT(*) n FROM orders WHERE clientId = ? AND kind = 'partner' AND status IN (?,?,?,?)")
       .get(cid, ORDER_STATUS.RECEIVED, ORDER_STATUS.PICKED_UP, ORDER_STATUS.WASHED, ORDER_STATUS.PACKED).n;
+    const receivedOrders = db
+      .prepare("SELECT COUNT(*) n FROM orders WHERE clientId = ? AND kind = 'partner' AND status = ?")
+      .get(cid, ORDER_STATUS.RECEIVED).n;
     const debt = db
       .prepare("SELECT docTotal, discount, paid FROM orders WHERE clientId = ? AND kind = 'partner' AND status = ?")
       .all(cid, ORDER_STATUS.DELIVERED)
-      .reduce((s, o) => s + round2(o.docTotal - o.discount - o.paid), 0);
-    res.json({ client: { id: c.id, name: c.name, phone: c.phone }, openOrders, debt: round2(debt) });
+      .reduce((s, o) => s + orderDebt(o), 0);
+    res.json({ client: { id: c.id, name: c.name, phone: c.phone }, inProgressOrders, receivedOrders, orderCap: PARTNER_OPEN_ORDER_CAP, debt: round2(debt) });
   });
 
   r.get('/services', (req, res) => {
@@ -137,12 +144,18 @@ export function partnerRouter(db) {
     db.transaction(() => {
       const o = mustOwn(docNum, req.user.clientId);
       if (o.status !== ORDER_STATUS.RECEIVED) throw conflict('Order can only be changed before pickup');
-      const own = new Set(getLines.all(docNum).map((l) => l.id));
+      const own = new Map(getLines.all(docNum).map((l) => [l.id, l]));
       const changes = req.valid.body.lines;
       if (!changes.every((l) => own.has(l.id))) throw badRequest('Line does not belong to this order');
       const upd = db.prepare('UPDATE order_lines SET expectedQuantity = ? WHERE id = ? AND docNum = ?');
-      for (const l of changes) upd.run(l.expectedQuantity, l.id, docNum);
-      logActivity(db, req.user, 'order', docNum, 'order.edited', { via: 'partner', lines: changes.map((l) => ({ id: l.id, expectedQuantity: l.expectedQuantity })) });
+      const logged = {};
+      for (const l of changes) {
+        const before = own.get(l.id);
+        upd.run(l.expectedQuantity, l.id, docNum);
+        const d = diff(before, { expectedQuantity: l.expectedQuantity }, ['expectedQuantity']);
+        if (d.expectedQuantity) logged[`${before.serviceName} (expected qty)`] = d.expectedQuantity;
+      }
+      if (Object.keys(logged).length) logActivity(db, req.user, 'order', docNum, 'order.edited', { via: 'partner', changes: logged });
     })();
     res.json(present(mustOwn(docNum, req.user.clientId)));
   });

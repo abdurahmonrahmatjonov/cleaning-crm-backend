@@ -794,7 +794,11 @@ test('partner api: 11th open order is 409', async () => {
   const { token } = await makePartner('Api Cap', '+998904000002', 'apiCap');
   for (let i = 0; i < 10; i++) assert.equal((await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).status, 201);
   assert.equal((await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).status, 409);
-  assert.equal((await P('GET', '/me', token)).body.openOrders, 10);
+  const me = (await P('GET', '/me', token)).body;
+  assert.equal(me.receivedOrders, 10);
+  assert.equal(me.inProgressOrders, 10);
+  assert.equal(me.orderCap, 10);
+  assert.equal(me.openOrders, undefined);
 });
 
 test('partner api: cross-client and non-partner orders are 404 on every :docNum route', async () => {
@@ -821,7 +825,7 @@ test('partner api: edit and cancel only in RECEIVED, line ids must belong to the
   const other = (await P('POST', '/orders', partnerA, { lines: [{ serviceId: 1 }] })).body;
   const lineId = o.lines[0].id;
   assert.equal((await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: other.lines[0].id, expectedQuantity: 9 }] })).status, 400);
-  assert.equal((await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: lineId, expectedQuantity: 0 }] })).status, 400);
+  assert.equal((await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: lineId, expectedQuantity: -1 }] })).status, 400);
   const ed = await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: lineId, expectedQuantity: 9, price: 1 }] });
   assert.equal(ed.status, 200);
   assert.equal(ed.body.lines[0].expectedQuantity, 9);
@@ -908,4 +912,49 @@ test('partner api: /statement matches the staff statement and validates month', 
   assert.equal((await P('GET', '/statement?month=2026-13', token)).status, 400);
   // another client's statement is unreachable by param
   assert.deepEqual((await P('GET', `/statement?clientId=${clientB}`, token)).body, mine.body);
+});
+
+test('partner api: edit logs staff-readable changes with real old values; 0 clears; unchanged logs nothing', async () => {
+  const o = (await P('POST', '/orders', partnerA, { lines: [{ serviceId: 1, expectedQuantity: 2 }] })).body;
+  const l = o.lines[0];
+  const hist = async () => (await call('GET', `/api/orders/${o.docNum}/history`, { token: admin })).body.data.filter((h) => h.action === 'order.edited');
+  assert.equal((await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: l.id, expectedQuantity: 2 }] })).status, 200);
+  assert.equal((await hist()).length, 0);
+  assert.equal((await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: l.id, expectedQuantity: 9 }] })).status, 200);
+  let h = await hist();
+  assert.equal(h.length, 1);
+  assert.equal(h[0].details.via, 'partner');
+  assert.deepEqual(h[0].details.changes, { [`${l.serviceName} (expected qty)`]: { from: 2, to: 9 } });
+  const clr = await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: l.id, expectedQuantity: 0 }] });
+  assert.equal(clr.status, 200);
+  assert.equal(clr.body.lines[0].expectedQuantity, 0);
+  h = await hist();
+  assert.deepEqual(h[1].details.changes[`${l.serviceName} (expected qty)`], { from: 9, to: 0 });
+  assert.equal((await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: l.id, expectedQuantity: 100001 }] })).status, 400);
+});
+
+test('partner api: /me counters and per-order debt floor', async () => {
+  const { client, token } = await makePartner('Api Me', '+998904000009', 'apiMe');
+  const a = (await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).body;
+  await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] });
+  await staffWalk(a.docNum, 'pickup');
+  let me = (await P('GET', '/me', token)).body;
+  assert.equal(me.receivedOrders, 1);
+  assert.equal(me.inProgressOrders, 2);
+  assert.equal(me.orderCap, 10);
+  // an overpaid delivered order must not offset another order's debt
+  seedDelivered(client.id, 100, D(1));
+  seedDelivered(client.id, 100, D(2));
+  const rows = db.prepare("SELECT docNum FROM orders WHERE clientId = ? AND status = 'Yetkazib berildi' ORDER BY docNum").all(client.id);
+  db.prepare('UPDATE orders SET paid = 150 WHERE docNum = ?').run(rows[0].docNum);
+  me = (await P('GET', '/me', token)).body;
+  assert.equal(me.debt, 100);
+});
+
+test('partner api: router exposes exactly the expected routes', async () => {
+  const { partnerRouter } = await import('../src/routes/partner.js');
+  const got = partnerRouter(db).stack.filter((l) => l.route)
+    .flatMap((l) => Object.keys(l.route.methods).map((m) => `${m.toUpperCase()} ${l.route.path}`)).sort();
+  const want = ['GET /me', 'GET /services', 'GET /orders', 'POST /orders', 'GET /orders/:docNum', 'PATCH /orders/:docNum', 'POST /orders/:docNum/cancel', 'GET /statement'].sort();
+  assert.deepEqual(got, want);
 });
