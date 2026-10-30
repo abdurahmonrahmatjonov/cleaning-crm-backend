@@ -531,3 +531,164 @@ test('staff create by name+phone detects an existing partner', async () => {
   assert.equal(r.body.kind, 'partner');
   assert.equal(r.body.lines[0].price, 6500);
 });
+
+// ---------- Task 6: lump payments, reversal, statement ----------
+const { today: todayStr } = await import('../src/utils/time.js');
+const MONTH = todayStr().slice(0, 7);
+const prevMonth = (() => { const [y, m] = MONTH.split('-').map(Number); return m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`; })();
+const D = (n) => `${MONTH}-${String(n).padStart(2, '0')}`;
+
+// delivered partner order inserted directly: [docTotal, deliveredDate, kv.m sqm]
+const seedDelivered = (clientId, docTotal, deliveredDate, sqm = 0, kind = 'partner') => {
+  const c = db.prepare('SELECT name, phone FROM clients WHERE id = ?').get(clientId);
+  const info = db.prepare(
+    `INSERT INTO orders (status, clientId, clientName, clientPhone, latitude, longitude, pickupPlannedAt, createdById, createdByName, docTotal, createdAt, orderTakenAt, deliveredDate, kind)
+     VALUES (?,?,?,?,0,0,'',1,'seed',?,?,?,?,?)`,
+  ).run('Yetkazib berildi', clientId, c.name, c.phone, docTotal, `${deliveredDate} 10:00:00`, `${deliveredDate} 10:00:00`, deliveredDate, kind);
+  if (sqm) {
+    const svc = db.prepare("SELECT id, name FROM services WHERE unit = 'kv.m' LIMIT 1").get();
+    db.prepare('INSERT INTO order_lines (docNum, serviceId, serviceName, price, customerPrice, quantity, sqm, lineTotal) VALUES (?,?,?,?,?,?,?,?)')
+      .run(info.lastInsertRowid, svc.id, svc.name, 1, 1, 1, sqm, docTotal);
+  }
+  return Number(info.lastInsertRowid);
+};
+const ord = (docNum) => db.prepare('SELECT paid, discount FROM orders WHERE docNum = ?').get(docNum);
+const debtOf = (id) => db.prepare("SELECT COALESCE(SUM(docTotal - discount - paid),0) d FROM orders WHERE clientId = ? AND kind = 'partner' AND status = 'Yetkazib berildi'").get(id).d;
+const pay = (id, body, token = operator) => call('POST', `/api/clients/${id}/payments`, { token, body });
+const stmt = (id, month, token = operator) => call('GET', `/api/clients/${id}/statement${month ? `?month=${month}` : ''}`, { token });
+
+test('lump payment: FIFO partial, statement, invariant, reversal', async () => {
+  const { client } = await makePartner('Lump A', '+998903000001', 'lumpA');
+  const o3 = seedDelivered(client.id, 300000, D(3), 12.5);
+  const o1 = seedDelivered(client.id, 100000, D(1), 4);
+  const o2 = seedDelivered(client.id, 200000, D(2));
+  const s0 = (await stmt(client.id)).body;
+  assert.equal(s0.charges, 600000);
+  assert.equal(s0.closing, debtOf(client.id));
+  assert.deepEqual(s0.orders.map((o) => o.docNum), [o1, o2, o3]);
+  assert.equal(s0.orders[0].sqmTotal, 4);
+
+  const r = await pay(client.id, { amount: 250000 });
+  assert.equal(r.status, 201);
+  assert.deepEqual(r.body.allocations, [{ docNum: o1, cash: 100000, disc: 0 }, { docNum: o2, cash: 150000, disc: 0 }]);
+  assert.equal(r.body.debtLeft, 350000);
+  assert.deepEqual([ord(o1).paid, ord(o2).paid, ord(o3).paid], [100000, 150000, 0]);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM payments WHERE batchId = ?').get(r.body.batchId).n, 2);
+  assert.ok(db.prepare("SELECT 1 FROM activity_log WHERE action = 'client.payment'").get());
+  const s1 = (await stmt(client.id)).body;
+  assert.equal(s1.charges, 600000);
+  assert.equal(s1.credits, 250000);
+  assert.equal(s1.closing, 350000);
+  assert.equal(s1.closing, debtOf(client.id));
+  assert.equal(s1.payments.length, 1);
+
+  // second sequential payment continues where the first stopped
+  const r2 = await pay(client.id, { amount: 50000, discount: 10000 });
+  assert.equal(r2.status, 201); // operator has orders.discount
+  assert.deepEqual(r2.body.allocations, [{ docNum: o2, cash: 40000, disc: 10000 }, { docNum: o3, cash: 10000, disc: 0 }]);
+  assert.equal((await stmt(client.id)).body.closing, debtOf(client.id));
+  assert.equal(debtOf(client.id), 290000);
+
+  // reverse the first batch (admin): paid back, payments rows gone, closing equals debt
+  assert.equal((await call('DELETE', `/api/clients/${client.id}/payments/${r.body.batchId}`, { token: operator })).status, 403);
+  const rev = await call('DELETE', `/api/clients/${client.id}/payments/${r.body.batchId}`, { token: admin });
+  assert.equal(rev.status, 200);
+  assert.deepEqual(rev.body, { reversed: true });
+  assert.deepEqual([ord(o1).paid, ord(o2).paid, ord(o2).discount, ord(o3).paid], [0, 40000, 10000, 10000]);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM payments WHERE batchId = ?').get(r.body.batchId).n, 0);
+  assert.equal((await call('DELETE', `/api/clients/${client.id}/payments/${r.body.batchId}`, { token: admin })).status, 409);
+  const s2 = (await stmt(client.id)).body;
+  assert.equal(s2.credits, 60000); // reversed batch excluded
+  assert.equal(s2.closing, debtOf(client.id));
+  assert.equal(debtOf(client.id), 540000);
+  const list = (await call('GET', `/api/clients/${client.id}/payments`, { token: operator })).body.data;
+  assert.equal(list.length, 2);
+  assert.ok(list.find((b) => b.batchId === r.body.batchId).reversedAt);
+  assert.ok(db.prepare("SELECT 1 FROM activity_log WHERE action = 'client.payment.reversed'").get());
+});
+
+test('lump payment: discount-only, overpayment, validation, permissions', async () => {
+  const { client } = await makePartner('Lump B', '+998903000002', 'lumpB');
+  const o1 = seedDelivered(client.id, 100000, D(1));
+  const o2 = seedDelivered(client.id, 200000, D(2));
+  const over = await pay(client.id, { amount: 300000, discount: 1 });
+  assert.equal(over.status, 400);
+  assert.match(over.body.error?.message ?? over.body.message ?? JSON.stringify(over.body), /300000/);
+  assert.equal(ord(o1).paid, 0);
+  assert.equal((await pay(client.id, { amount: 0 })).status, 400);
+  assert.equal((await pay(client.id, { amount: 10, paidDate: '2026-13-40' })).status, 400);
+  const d = await pay(client.id, { discount: 50000 });
+  assert.equal(d.status, 201);
+  assert.deepEqual(d.body.allocations, [{ docNum: o1, cash: 0, disc: 50000 }]);
+  assert.deepEqual(ord(o1), { paid: 0, discount: 50000 });
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM payments WHERE batchId = ?').get(d.body.batchId).n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM payment_batches WHERE batchId = ?').get(d.body.batchId).n, 1);
+  // exact full payoff
+  assert.equal((await pay(client.id, { amount: 250000 })).body.debtLeft, 0);
+  assert.equal((await pay(client.id, { amount: 1 })).status, 400);
+  // reverse the discount-only batch
+  assert.equal((await call('DELETE', `/api/clients/${client.id}/payments/${d.body.batchId}`, { token: admin })).status, 200);
+  assert.deepEqual(ord(o1), { paid: 50000, discount: 0 });
+  assert.equal(ord(o2).paid, 200000);
+
+  // permissions: a role with orders.payments only cannot give a discount
+  const role = await call('POST', '/api/roles', { token: admin, body: { name: 'Cashier Only', permissions: ['orders.payments', 'clients.view'] } });
+  assert.equal(role.status, 201);
+  assert.equal((await call('POST', '/api/users', { token: admin, body: { username: 'cashier1', fullName: 'Cash', password: 'password123', role: role.body.key } })).status, 201);
+  const cashier = await login('cashier1', 'password123');
+  const { client: c2 } = await makePartner('Lump B2', '+998903000003', 'lumpB2');
+  seedDelivered(c2.id, 100000, D(1));
+  assert.equal((await pay(c2.id, { amount: 1000, discount: 500 }, cashier)).status, 403);
+  assert.equal((await pay(c2.id, { amount: 1000 }, cashier)).status, 201);
+  assert.equal(ord(db.prepare('SELECT docNum FROM orders WHERE clientId = ?').get(c2.id).docNum).paid, 1000);
+  // no token / saygak
+  assert.equal((await pay(c2.id, { amount: 1 }, partnerA)).status, 403);
+});
+
+test('lump payment: batches are per client, non-partner refused, rounding stays exact', async () => {
+  const { client: a } = await makePartner('Lump C', '+998903000004', 'lumpC');
+  const { client: b } = await makePartner('Lump D', '+998903000005', 'lumpD');
+  seedDelivered(a.id, 1000, D(1));
+  seedDelivered(b.id, 1000, D(1));
+  const rb = await pay(b.id, { amount: 100 });
+  assert.equal((await call('DELETE', `/api/clients/${a.id}/payments/${rb.body.batchId}`, { token: admin })).status, 404);
+  assert.equal((await call('DELETE', `/api/clients/${b.id}/payments/nope`, { token: admin })).status, 404);
+  assert.equal(ord(db.prepare('SELECT docNum FROM orders WHERE clientId = ?').get(b.id).docNum).paid, 100);
+  const plain = (await call('POST', '/api/clients', { token: operator, body: { name: 'Plain Lump', phone: '+998903000006' } })).body;
+  assert.equal((await pay(plain.id, { amount: 10 })).status, 409);
+  assert.equal((await pay(999999, { amount: 10 })).status, 404);
+  // cents: 0.1 + 0.2 style amounts must not drift or be rejected as overpayment
+  const { client: c } = await makePartner('Lump E', '+998903000007', 'lumpE');
+  const o = seedDelivered(c.id, 0.3, D(1));
+  assert.equal((await pay(c.id, { amount: 0.1 })).status, 201);
+  const last = await pay(c.id, { amount: 0.2 });
+  assert.equal(last.status, 201);
+  assert.equal(last.body.debtLeft, 0);
+  assert.equal(ord(o).paid, 0.3);
+  // regular (non-partner kind) orders of a saygak are not touched
+  seedDelivered(c.id, 5000, D(1), 0, 'regular');
+  assert.equal((await pay(c.id, { amount: 1 })).status, 400);
+});
+
+test('statement: opening from earlier months, month validation, in-progress without amounts', async () => {
+  const { client } = await makePartner('Stmt A', '+998903000008', 'stmtA');
+  seedDelivered(client.id, 70000, `${prevMonth}-15`);
+  seedDelivered(client.id, 30000, D(1));
+  const prevPaid = await pay(client.id, { amount: 20000, paidDate: `${prevMonth}-20` });
+  assert.equal(prevPaid.status, 201);
+  const prev = (await stmt(client.id, prevMonth)).body;
+  assert.deepEqual([prev.opening, prev.charges, prev.credits, prev.closing], [0, 70000, 20000, 50000]);
+  const cur = (await stmt(client.id, MONTH)).body;
+  assert.deepEqual([cur.opening, cur.charges, cur.credits, cur.closing], [50000, 30000, 0, 80000]);
+  assert.equal(cur.closing, debtOf(client.id));
+  for (const m of ['2026-13', '2026-00', '26-10', 'abc', '2026-1']) assert.equal((await stmt(client.id, m)).status, 400, m);
+  assert.equal((await stmt(client.id)).body.month, MONTH);
+  // in-progress orders carry no amounts
+  const ip = seedDelivered(client.id, 999, D(1));
+  db.prepare("UPDATE orders SET status = 'Olib Ketildi', deliveredDate = '' WHERE docNum = ?").run(ip);
+  const s = (await stmt(client.id)).body;
+  assert.deepEqual(s.inProgress.map((x) => x.docNum), [ip]);
+  assert.deepEqual(Object.keys(s.inProgress[0]).sort(), ['createdAt', 'docNum', 'status']);
+  assert.equal(s.closing, debtOf(client.id));
+  assert.equal((await stmt(client.id, MONTH, partnerA)).status, 403);
+});

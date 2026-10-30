@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
@@ -5,10 +6,20 @@ import bcrypt from 'bcryptjs';
 import { requirePerm, requireRole } from '../middleware/auth.js';
 import { ORDER_STATUS } from '../db.js';
 import { badRequest, conflict, notFound } from '../utils/httpError.js';
-import { id as idSchema, pagination, phoneString } from '../utils/schemas.js';
+import { dateString, id as idSchema, money, pagination, phoneString } from '../utils/schemas.js';
 import { diff, logActivity } from '../utils/activity.js';
 import { presentAddress, rememberAddress } from '../utils/addresses.js';
-import { nowDateTime } from '../utils/time.js';
+import { nowDateTime, today } from '../utils/time.js';
+import { HttpError } from '../utils/httpError.js';
+import { round2 } from '../utils/sizes.js';
+import { buildStatement, MONTH_RE } from '../utils/statement.js';
+
+const lumpSchema = z
+  .object({ amount: money.default(0), discount: money.default(0), paidDate: dateString.optional() })
+  .strict()
+  .refine((o) => round2(o.amount) + round2(o.discount) > 0, 'Enter an amount, a discount, or both');
+const batchParams = z.object({ id: idSchema, batchId: z.string().min(1).max(64) });
+const statementQuery = z.object({ month: z.string().regex(MONTH_RE, 'Expected YYYY-MM').optional() });
 
 const listQuery = pagination.extend({ search: z.string().trim().max(100).optional() });
 const params = z.object({ id: idSchema });
@@ -217,6 +228,94 @@ export function clientsRouter(db) {
     db.prepare('UPDATE users SET isActive = ? WHERE id = ?').run(req.valid.body.isActive ? 1 : 0, u.id);
     logActivity(db, req.user, 'client', id, 'client.login.active', { username: u.username, isActive: req.valid.body.isActive });
     res.json(loginOf(id));
+  });
+
+  // ----- saygak lump payments (FIFO), reversal and monthly statement -----
+  router.post('/:id/payments', requirePerm('orders.payments'), validate(params, 'params'), validate(lumpSchema), (req, res) => {
+    const { id } = req.valid.params;
+    const amount = round2(req.valid.body.amount);
+    const discount = round2(req.valid.body.discount);
+    const date = req.valid.body.paidDate ?? today();
+    getPartner(id);
+    if (discount > 0 && !req.user.permissions.includes('orders.discount')) throw new HttpError(403, 'You are not allowed to give discounts');
+    const result = db.transaction(() => {
+      const rows = db
+        .prepare(
+          `SELECT docNum, docTotal, discount, paid FROM orders
+           WHERE clientId = ? AND kind = 'partner' AND status = ? ORDER BY deliveredDate, docNum`,
+        )
+        .all(id, ORDER_STATUS.DELIVERED);
+      const owed = (o) => round2(o.docTotal - o.discount - o.paid);
+      const open = rows.filter((o) => owed(o) > 0);
+      const totalDebt = round2(open.reduce((s, o) => s + owed(o), 0));
+      if (round2(amount + discount) > totalDebt) throw badRequest(`Amount and discount exceed the debt (${totalDebt})`);
+      const batchId = randomUUID();
+      const now = nowDateTime();
+      let cashLeft = amount;
+      let discLeft = discount;
+      const allocations = [];
+      const upd = db.prepare('UPDATE orders SET paid = ?, discount = ? WHERE docNum = ?');
+      const insPay = db.prepare(
+        `INSERT INTO payments (docNum, amount, discount, paidDate, createdAt, creatorId, creatorName, batchId) VALUES (?,?,?,?,?,?,?,?)`,
+      );
+      for (const o of open) {
+        const debt = owed(o);
+        const disc = Math.min(discLeft, debt);
+        discLeft = round2(discLeft - disc);
+        const cash = Math.min(cashLeft, round2(debt - disc));
+        cashLeft = round2(cashLeft - cash);
+        if (!cash && !disc) continue;
+        upd.run(round2(o.paid + cash), round2(o.discount + disc), o.docNum);
+        if (cash > 0) insPay.run(o.docNum, cash, disc, date, now, req.user.id, req.user.fullName, batchId);
+        allocations.push({ docNum: o.docNum, cash, disc });
+        if (cashLeft === 0 && discLeft === 0) break;
+      }
+      db.prepare(
+        `INSERT INTO payment_batches (batchId, clientId, amount, discount, paidDate, createdAt, creatorId, creatorName, allocations) VALUES (?,?,?,?,?,?,?,?,?)`,
+      ).run(batchId, id, amount, discount, date, now, req.user.id, req.user.fullName, JSON.stringify(allocations));
+      logActivity(db, req.user, 'client', id, 'client.payment', {
+        batchId, amount, discount, paidDate: date, orders: allocations.length, allocations,
+      });
+      return { batchId, allocations, debtLeft: round2(totalDebt - amount - discount) };
+    })();
+    res.status(201).json(result);
+  });
+
+  router.get('/:id/payments', validate(params, 'params'), (req, res) => {
+    const { id } = req.valid.params;
+    getClient(id);
+    const rows = db.prepare('SELECT * FROM payment_batches WHERE clientId = ? ORDER BY createdAt DESC, rowid DESC').all(id);
+    res.json({ data: rows.map((b) => ({ ...b, allocations: JSON.parse(b.allocations) })) });
+  });
+
+  router.delete('/:id/payments/:batchId', adminOnly, validate(batchParams, 'params'), (req, res) => {
+    const { id, batchId } = req.valid.params;
+    getClient(id);
+    db.transaction(() => {
+      const b = db.prepare('SELECT * FROM payment_batches WHERE batchId = ? AND clientId = ?').get(batchId, id);
+      if (!b) throw notFound('Payment batch not found');
+      if (b.reversedAt) throw conflict('This payment is already reversed');
+      const get = db.prepare('SELECT paid, discount FROM orders WHERE docNum = ?');
+      const upd = db.prepare('UPDATE orders SET paid = ?, discount = ? WHERE docNum = ?');
+      for (const a of JSON.parse(b.allocations)) {
+        const o = get.get(a.docNum);
+        if (!o) throw conflict(`Order ${a.docNum} no longer exists`);
+        const paid = round2(o.paid - a.cash);
+        const discount = round2(o.discount - a.disc);
+        if (paid < 0 || discount < 0) throw conflict(`Cannot reverse: order ${a.docNum} would go negative`);
+        upd.run(paid, discount, a.docNum);
+      }
+      db.prepare('DELETE FROM payments WHERE batchId = ?').run(batchId);
+      db.prepare('UPDATE payment_batches SET reversedAt = ?, reversedByName = ? WHERE batchId = ?').run(nowDateTime(), req.user.fullName, batchId);
+      logActivity(db, req.user, 'client', id, 'client.payment.reversed', { batchId, amount: b.amount, discount: b.discount });
+    })();
+    res.json({ reversed: true });
+  });
+
+  router.get('/:id/statement', validate(params, 'params'), validate(statementQuery, 'query'), (req, res) => {
+    const { id } = req.valid.params;
+    getClient(id);
+    res.json(buildStatement(db, id, req.valid.query.month ?? today().slice(0, 7)));
   });
 
   // Only clients with no orders can go; the rest keep their history.
