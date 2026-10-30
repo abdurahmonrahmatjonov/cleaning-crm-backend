@@ -9,8 +9,8 @@ import { nowDateTime, today } from '../utils/time.js';
 import { diff, logActivity } from '../utils/activity.js';
 import { HttpError } from '../utils/httpError.js';
 import { rememberAddress } from '../utils/addresses.js';
+import { loadSizes, normalizeSizes, replaceSizes, round2, sizeRow, sizesTotal } from '../utils/sizes.js';
 
-const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 
 // ---------- request schemas ----------
 
@@ -49,7 +49,7 @@ const pickupSchema = z.object({
 
 // Washing and packing each re-count the pieces: every line of the order, exactly once.
 const countSchema = z.object({
-  lines: z.array(z.object({ id: idSchema, quantity: z.number().int().min(1).max(100000) })).min(1),
+  lines: z.array(z.object({ id: idSchema, quantity: z.number().int().min(1).max(100000), sizes: z.array(sizeRow).max(100).optional() })).min(1),
 });
 
 const deliverSchema = z.object({
@@ -115,7 +115,7 @@ export function orderRouter(db) {
 
   const getService = db.prepare('SELECT id, name, unit FROM services WHERE id = ? AND isActive = 1');
 
-  const presentLine = (l) => ({
+  const presentLine = (l, sizes = []) => ({
     id: l.id,
     serviceId: l.serviceId,
     serviceName: l.serviceName,
@@ -129,9 +129,11 @@ export function orderRouter(db) {
     sqm: l.sqm,
     lineTotal: l.lineTotal,
     currency: l.currency,
+    sizes,
+    sizesTotal: sizesTotal(sizes),
   });
 
-  const presentOrder = (o, lines) => ({
+  const presentOrder = (o, lines, sizeMap = new Map()) => ({
     docNum: o.docNum,
     status: o.status,
     docStatus: o.docStatus,
@@ -162,12 +164,12 @@ export function orderRouter(db) {
     deliveredBy: o.deliveredByName,
     cancelReason: o.cancelReason,
     cancelledAt: o.cancelledAt,
-    lines: lines.map(presentLine),
+    lines: lines.map((l) => presentLine(l, sizeMap.get(l.id) ?? [])),
   });
 
   const loadOrder = (docNum) => {
     const o = getOrder.get(docNum);
-    return o ? presentOrder(o, getLines.all(docNum)) : null;
+    return o ? presentOrder(o, getLines.all(docNum), loadSizes(db, [docNum])) : null;
   };
 
   /** Make sure `given` ids are exactly the order's line ids: no missing, extra or duplicate. */
@@ -209,8 +211,9 @@ export function orderRouter(db) {
         byDoc.get(l.docNum).push(l);
       }
     }
+    const sizeMap = loadSizes(db, orders.map((o) => o.docNum));
     res.json({
-      data: orders.map((o) => presentOrder(o, byDoc.get(o.docNum))),
+      data: orders.map((o) => presentOrder(o, byDoc.get(o.docNum), sizeMap)),
       meta: { page, limit, total },
     });
   };
@@ -327,7 +330,16 @@ export function orderRouter(db) {
       assertAllLines(docNum, b.lines);
       const before = new Map(getLines.all(docNum).map((l) => [l.id, l]));
       const set = db.prepare(`UPDATE order_lines SET ${column} = ? WHERE id = ? AND docNum = ?`);
-      for (const l of b.lines) set.run(l.quantity, l.id, docNum);
+      const oldSizes = loadSizes(db, [docNum]);
+      const sizeLog = new Map();
+      for (const l of b.lines) {
+        set.run(l.quantity, l.id, docNum);
+        if (l.sizes === undefined) continue;
+        if (before.get(l.id).unit !== 'kv.m') throw badRequest('Sizes are only for kv.m services', { lineId: l.id });
+        const rows = normalizeSizes(l.sizes);
+        sizeLog.set(l.id, { from: oldSizes.get(l.id) ?? [], to: rows });
+        replaceSizes(db, l.id, rows);
+      }
       db.prepare(`UPDATE orders SET status = ?, ${cols.at} = ?, ${cols.byId} = ?, ${cols.byName} = ? WHERE docNum = ?`).run(
         to,
         nowDateTime(),
@@ -340,9 +352,11 @@ export function orderRouter(db) {
         to,
         counts: b.lines.map((l) => {
           const old = before.get(l.id);
-          return column === 'quantity'
+          const entry = column === 'quantity'
             ? { service: old.serviceName, picked: old.pickedQuantity, washed: old.washedQuantity, packed: l.quantity }
             : { service: old.serviceName, picked: old.pickedQuantity, washed: l.quantity };
+          if (sizeLog.has(l.id)) entry.sizes = sizeLog.get(l.id);
+          return entry;
         }),
       });
     })();
@@ -387,6 +401,8 @@ export function orderRouter(db) {
         `UPDATE order_lines SET sqm = ?, lineTotal = ?, status = 'Closed' WHERE id = ? AND docNum = ?`,
       );
       let docTotal = 0;
+      const sizeMap = loadSizes(db, [docNum]);
+      const logLines = [];
       for (const l of b.lines) {
         const line = existing.get(l.id);
         // per-piece lines are charged by the counted pieces; the others need a measured amount
@@ -395,6 +411,7 @@ export function orderRouter(db) {
         const lineTotal = round2(amount * line.price);
         docTotal += lineTotal;
         setLine.run(amount, lineTotal, l.id, docNum);
+        if (line.unit === 'kv.m') logLines.push({ service: line.serviceName, sizesTotal: sizesTotal(sizeMap.get(l.id) ?? []), sqm: amount });
       }
       if (discount > round2(docTotal)) throw badRequest('Discount cannot be more than the order total');
       db.prepare(
@@ -415,7 +432,7 @@ export function orderRouter(db) {
       if (b.paid > 0) insertPayment(docNum, b.paid, deliveredDate, req.user, discount);
       logActivity(db, req.user, 'order', docNum, 'order.delivered', {
         from: order.status, to: ORDER_STATUS.DELIVERED, docTotal: round2(docTotal), discount, paid: b.paid,
-        debt: Math.max(round2(docTotal - discount - b.paid), 0), deliveredDate,
+        debt: Math.max(round2(docTotal - discount - b.paid), 0), deliveredDate, lines: logLines,
       });
     })();
 
