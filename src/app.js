@@ -22,6 +22,7 @@ import { partnerRouter } from './routes/partner.js';
 export const STAFF_MOUNTS = [];
 
 export function createApp(db, opts = {}) {
+  // The export always reflects the most recently built app; mounts must stay unconditional.
   STAFF_MOUNTS.length = 0;
   const app = express();
   app.disable('x-powered-by');

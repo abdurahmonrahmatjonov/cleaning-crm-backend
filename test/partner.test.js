@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 process.env.JWT_SECRET = 'test-secret';
 const { openDb, seed } = await import('../src/db.js');
 const { createApp, STAFF_MOUNTS } = await import('../src/app.js');
+const { partnerGate, requirePartner } = await import('../src/middleware/auth.js');
+const { default: express } = await import('express');
 
 let server, base, db;
 let admin, operator, driver, packer;
@@ -293,6 +295,43 @@ test('access gate: saygak denied on every staff mount; staff denied on /partner'
   const n = STAFF_MOUNTS.length;
   createApp(db, { loginLimit: 1000 });
   assert.equal(STAFF_MOUNTS.length, n);
+});
+
+/** Walks the real Express 5 stack and lists every router/route mount that is not behind partnerGate/requirePartner. */
+function ungatedMounts(app) {
+  const probes = ['/api/auth', '/api/branding', '/api/leak', '/api/partner', '/health'];
+  const label = (layer, i) => probes.find((p) => layer.matchers?.[0]?.(`${p}/x`) || layer.matchers?.[0]?.(p)) ?? `#${i}`;
+  const out = [];
+  const stack = app.router.stack;
+  stack.forEach((layer, i) => {
+    if (layer.route) return void out.push(`route:${layer.route.path}`);
+    if (layer.name !== 'router') return;
+    for (let j = i - 1; j >= 0 && stack[j].name !== 'router'; j--) {
+      if (stack[j].handle === partnerGate || stack[j].handle === requirePartner) return;
+    }
+    out.push(label(layer, i));
+  });
+  return out;
+}
+
+test('access gate (structural): every mounted router sits behind the gate except auth and branding', () => {
+  const app = createApp(db, { loginLimit: 1000 });
+  assert.deepEqual(ungatedMounts(app).sort(), ['/api/auth', '/api/branding', 'route:/health']);
+  // negative control: a plain app.use that bypasses mount() must be flagged
+  const leaky = createApp(db, { loginLimit: 1000 });
+  leaky.use('/api/leak', express.Router().get('/', (_req, res) => res.json({ leaked: true })));
+  assert.ok(ungatedMounts(leaky).includes('/api/leak'));
+  const bare = express();
+  bare.use('/api/x', express.Router());
+  assert.deepEqual(ungatedMounts(bare), ['#0']);
+});
+
+test('partnerGate / requirePartner fail closed on clientId 0', () => {
+  const run = (mw, user) => { let arg = 'unset'; mw({ user }, {}, (e) => { arg = e; }); return arg; };
+  assert.equal(run(partnerGate, { clientId: 0 })?.status, 403);
+  assert.equal(run(requirePartner, { clientId: null })?.status, 403);
+  assert.equal(run(requirePartner, { clientId: 0 }), undefined);
+  assert.equal(run(partnerGate, { clientId: null }), undefined);
 });
 
 test('access gate: deactivated saygak gets 401, not 403', async () => {
