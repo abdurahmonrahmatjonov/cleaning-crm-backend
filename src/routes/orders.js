@@ -1,19 +1,26 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
-import { requireRole } from '../middleware/auth.js';
+import { requirePerm } from '../middleware/auth.js';
 import { ORDER_STATUS } from '../db.js';
 import { badRequest, conflict, notFound } from '../utils/httpError.js';
 import { dateString, dateTimeString, id as idSchema, money, pagination, phoneString } from '../utils/schemas.js';
 import { nowDateTime, today } from '../utils/time.js';
+import { diff, logActivity } from '../utils/activity.js';
+import { HttpError } from '../utils/httpError.js';
+import { rememberAddress } from '../utils/addresses.js';
 
 const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
 
 // ---------- request schemas ----------
 
-const createSchema = z.object({
-  clientName: z.string().trim().min(1).max(150),
-  clientPhone: phoneString,
+const clientNameField = z.string().trim().min(1).max(150);
+const createSchema = z
+  .object({
+  // Pick an existing client (their saved name/phone are used), or give a name and phone for a new one.
+  clientId: idSchema.optional(),
+  clientName: clientNameField.optional(),
+  clientPhone: phoneString.optional(),
   location: z.object({
     latitude: z.number().min(-90).max(90),
     longitude: z.number().min(-180).max(180),
@@ -29,7 +36,8 @@ const createSchema = z.object({
     )
     .min(1)
     .max(50),
-});
+  })
+  .refine((o) => o.clientId || (o.clientName && o.clientPhone), 'Choose a client, or enter a name and phone number');
 
 const pickupSchema = z.object({
   waybillNumber: z.string().trim().min(1).max(50), // nakladnoy
@@ -39,16 +47,23 @@ const pickupSchema = z.object({
     .min(1),
 });
 
+// Washing and packing each re-count the pieces: every line of the order, exactly once.
+const countSchema = z.object({
+  lines: z.array(z.object({ id: idSchema, quantity: z.number().int().min(1).max(100000) })).min(1),
+});
+
 const deliverSchema = z.object({
   deliveredDate: dateString.optional(), // defaults to today
   paid: money, // mijozdan olingan summa
-  lines: z.array(z.object({ id: idSchema, sqm: z.number().positive().max(1e6) })).min(1),
+  discount: money.optional(), // chegirma (needs the orders.discount permission)
+  // `sqm` is the measured amount in the line's unit (kv.m or metr). Not needed for per-piece (dona) lines.
+  lines: z.array(z.object({ id: idSchema, sqm: z.number().positive().max(1e6).optional() })).min(1),
 });
 
 const editSchema = z
   .object({
-    clientName: createSchema.shape.clientName,
-    clientPhone: createSchema.shape.clientPhone,
+    clientName: clientNameField,
+    clientPhone: phoneString,
     location: createSchema.shape.location,
     landmark: createSchema.shape.landmark.unwrap(),
     pickupTime: createSchema.shape.pickupTime,
@@ -58,10 +73,13 @@ const editSchema = z
 
 const cancelSchema = z.object({ reason: z.string().trim().min(1).max(300) });
 
-const paymentSchema = z.object({
-  amount: z.number().positive().max(1e12),
-  paidDate: dateString.optional(), // defaults to today
-});
+const paymentSchema = z
+  .object({
+    amount: money.default(0),
+    discount: money.default(0), // chegirma: written off instead of paid
+    paidDate: dateString.optional(), // defaults to today
+  })
+  .refine((o) => o.amount + o.discount > 0, 'Enter an amount, a discount, or both');
 
 const listQuery = pagination.extend({ search: z.string().trim().max(100).optional() });
 const params = z.object({ docNum: idSchema });
@@ -76,26 +94,38 @@ export function orderRouter(db) {
   const findClient = db.prepare('SELECT id FROM clients WHERE phone = ?');
   const insertClient = db.prepare('INSERT INTO clients (name, phone, createdAt) VALUES (?,?,?)');
   // One client per phone number: reuse the record if this phone was seen before.
-  const clientIdFor = (name, phone) =>
-    findClient.get(phone)?.id ?? insertClient.run(name, phone, nowDateTime()).lastInsertRowid;
+  const clientIdFor = (name, phone, user) => {
+    const existing = findClient.get(phone)?.id;
+    if (existing) return existing;
+    const id = insertClient.run(name, phone, nowDateTime()).lastInsertRowid;
+    logActivity(db, user, 'client', id, 'client.created', { name, phone, via: 'order' });
+    return id;
+  };
 
-  const insertPayment = (docNum, amount, paidDate, user) =>
+  const insertPayment = (docNum, amount, paidDate, user, discount = 0) =>
     db
       .prepare(
-        `INSERT INTO payments (docNum, amount, paidDate, createdAt, creatorId, creatorName) VALUES (?,?,?,?,?,?)`,
+        `INSERT INTO payments (docNum, amount, discount, paidDate, createdAt, creatorId, creatorName) VALUES (?,?,?,?,?,?,?)`,
       )
-      .run(docNum, amount, paidDate, nowDateTime(), user.id, user.fullName);
+      .run(docNum, amount, discount, paidDate, nowDateTime(), user.id, user.fullName);
 
-  const getService = db.prepare('SELECT id, name FROM services WHERE id = ? AND isActive = 1');
+  const needDiscountPerm = (user) => {
+    if (!user.permissions.includes('orders.discount')) throw new HttpError(403, 'You are not allowed to give discounts');
+  };
+
+  const getService = db.prepare('SELECT id, name, unit FROM services WHERE id = ? AND isActive = 1');
 
   const presentLine = (l) => ({
     id: l.id,
     serviceId: l.serviceId,
     serviceName: l.serviceName,
     status: l.status,
+    unit: l.unit,
     price: l.price,
     customerPrice: l.customerPrice, // per-kv.m price actually charged (defaults to price; for discounts)
-    quantity: l.quantity,
+    quantity: l.quantity, // what the client is charged for (the packed count once packed)
+    pickedQuantity: l.pickedQuantity,
+    washedQuantity: l.washedQuantity,
     sqm: l.sqm,
     lineTotal: l.lineTotal,
     currency: l.currency,
@@ -113,17 +143,22 @@ export function orderRouter(db) {
     pickupTime: o.pickupPlannedAt,
     createdBy: { id: o.createdById, name: o.createdByName },
     docTotal: o.docTotal,
+    discount: o.discount,
     paid: o.paid,
-    debt: Math.max(round2(o.docTotal - o.paid), 0),
+    debt: Math.max(round2(o.docTotal - o.discount - o.paid), 0),
     docRate: o.docRate,
     createdAt: o.createdAt,
     orderTakenAt: o.orderTakenAt,
     deliveryTime: o.deliveryTime,
     pickedUpAt: o.pickedUpAt,
+    washedAt: o.washedAt,
+    packedAt: o.packedAt,
     deliveredDate: o.deliveredDate,
     deliveredAt: o.deliveredAt,
     waybillNumber: o.waybillNumber,
     pickedUpBy: o.pickedUpByName,
+    washedBy: o.washedByName,
+    packedBy: o.packedByName,
     deliveredBy: o.deliveredByName,
     cancelReason: o.cancelReason,
     cancelledAt: o.cancelledAt,
@@ -184,7 +219,7 @@ export function orderRouter(db) {
 
   router.get('/received', validate(listQuery, 'query'), listByStatus(ORDER_STATUS.RECEIVED));
 
-  router.post('/', requireRole('admin', 'operator'), validate(createSchema), (req, res) => {
+  router.post('/', requirePerm('orders.create'), validate(createSchema), (req, res) => {
     const b = req.valid.body;
     const now = nowDateTime();
 
@@ -193,8 +228,18 @@ export function orderRouter(db) {
       const lines = b.lines.map((l, i) => {
         const svc = getService.get(l.serviceId);
         if (!svc) throw badRequest(`Unknown or inactive service`, { path: `lines.${i}.serviceId` });
-        return { ...l, serviceName: svc.name };
+        return { ...l, serviceName: svc.name, unit: svc.unit };
       });
+      let clientId, clientName, clientPhone;
+      if (b.clientId) {
+        const c = db.prepare('SELECT * FROM clients WHERE id = ?').get(b.clientId);
+        if (!c) throw badRequest('Unknown client', { path: 'clientId' });
+        ({ id: clientId, name: clientName, phone: clientPhone } = c);
+      } else {
+        ({ clientName, clientPhone } = b);
+        clientId = clientIdFor(clientName, clientPhone, req.user);
+      }
+      rememberAddress(db, clientId, b.location, b.landmark);
       const info = db
         .prepare(
           `INSERT INTO orders (status, clientId, clientName, clientPhone, latitude, longitude, landmark, pickupPlannedAt,
@@ -204,9 +249,9 @@ export function orderRouter(db) {
         )
         .run({
           status: ORDER_STATUS.RECEIVED,
-          clientId: clientIdFor(b.clientName, b.clientPhone),
-          clientName: b.clientName,
-          clientPhone: b.clientPhone,
+          clientId,
+          clientName,
+          clientPhone,
           latitude: b.location.latitude,
           longitude: b.location.longitude,
           landmark: b.landmark,
@@ -217,9 +262,15 @@ export function orderRouter(db) {
           now,
         });
       const insertLine = db.prepare(
-        `INSERT INTO order_lines (docNum, serviceId, serviceName, price, customerPrice) VALUES (?,?,?,?,?)`,
+        `INSERT INTO order_lines (docNum, serviceId, serviceName, unit, price, customerPrice) VALUES (?,?,?,?,?,?)`,
       );
-      for (const l of lines) insertLine.run(info.lastInsertRowid, l.serviceId, l.serviceName, l.price, l.price);
+      for (const l of lines) insertLine.run(info.lastInsertRowid, l.serviceId, l.serviceName, l.unit, l.price, l.price);
+      logActivity(db, req.user, 'order', info.lastInsertRowid, 'order.created', {
+        client: clientName,
+        phone: clientPhone,
+        clientId,
+        services: lines.map((l) => `${l.serviceName} (${l.price}/${l.unit})`),
+      });
       return info.lastInsertRowid;
     })();
 
@@ -227,7 +278,7 @@ export function orderRouter(db) {
   });
 
   // Driver picked the laundry up: waybill no., planned delivery time, item counts.
-  router.patch('/:docNum/pickup', validate(params, 'params'), validate(pickupSchema), (req, res) => {
+  router.patch('/:docNum/pickup', requirePerm('orders.pickup'), validate(params, 'params'), validate(pickupSchema), (req, res) => {
     const { docNum } = req.valid.params;
     const b = req.valid.body;
 
@@ -238,12 +289,16 @@ export function orderRouter(db) {
         throw conflict(`Order is "${order.status}", expected "${ORDER_STATUS.RECEIVED}"`);
       }
       assertAllLines(docNum, b.lines);
-      const setQty = db.prepare('UPDATE order_lines SET quantity = ? WHERE id = ? AND docNum = ?');
-      for (const l of b.lines) setQty.run(l.quantity, l.id, docNum);
+      const setQty = db.prepare('UPDATE order_lines SET quantity = ?, pickedQuantity = ? WHERE id = ? AND docNum = ?');
+      for (const l of b.lines) setQty.run(l.quantity, l.quantity, l.id, docNum);
       db.prepare(
         `UPDATE orders SET status = ?, waybillNumber = ?, deliveryTime = ?, pickedUpAt = ?,
                            pickedUpById = ?, pickedUpByName = ? WHERE docNum = ?`,
       ).run(ORDER_STATUS.PICKED_UP, b.waybillNumber, b.deliveryTime, nowDateTime(), req.user.id, req.user.fullName, docNum);
+      logActivity(db, req.user, 'order', docNum, 'order.pickedup', {
+        from: order.status, to: ORDER_STATUS.PICKED_UP, waybill: b.waybillNumber, deliveryTime: b.deliveryTime,
+        quantities: b.lines.length ? b.lines.map((l) => l.quantity) : [],
+      });
     })();
 
     res.json(loadOrder(docNum));
@@ -253,8 +308,66 @@ export function orderRouter(db) {
 
   router.get('/picked-up', validate(listQuery, 'query'), listByStatus(ORDER_STATUS.PICKED_UP));
 
+  // ---------- washed -> packed (workshop steps between pickup and delivery) ----------
+
+  router.get('/washed', validate(listQuery, 'query'), listByStatus(ORDER_STATUS.WASHED));
+  router.get('/packed', validate(listQuery, 'query'), listByStatus(ORDER_STATUS.PACKED));
+
+  /**
+   * Move an order one step forward in the workshop (`from` -> `to`) with a fresh count of the pieces:
+   * stamps who did it and when, and lets `column` store each line's count.
+   */
+  const step = (from, to, cols, column, action) => (req, res) => {
+    const { docNum } = req.valid.params;
+    const b = req.valid.body;
+    db.transaction(() => {
+      const order = getOrder.get(docNum);
+      if (!order) throw notFound('Order not found');
+      if (order.status !== from) throw conflict(`Order is "${order.status}", expected "${from}"`);
+      assertAllLines(docNum, b.lines);
+      const before = new Map(getLines.all(docNum).map((l) => [l.id, l]));
+      const set = db.prepare(`UPDATE order_lines SET ${column} = ? WHERE id = ? AND docNum = ?`);
+      for (const l of b.lines) set.run(l.quantity, l.id, docNum);
+      db.prepare(`UPDATE orders SET status = ?, ${cols.at} = ?, ${cols.byId} = ?, ${cols.byName} = ? WHERE docNum = ?`).run(
+        to,
+        nowDateTime(),
+        req.user.id,
+        req.user.fullName,
+        docNum,
+      );
+      logActivity(db, req.user, 'order', docNum, action, {
+        from,
+        to,
+        counts: b.lines.map((l) => {
+          const old = before.get(l.id);
+          return column === 'quantity'
+            ? { service: old.serviceName, picked: old.pickedQuantity, washed: old.washedQuantity, packed: l.quantity }
+            : { service: old.serviceName, picked: old.pickedQuantity, washed: l.quantity };
+        }),
+      });
+    })();
+    res.json(loadOrder(docNum));
+  };
+
+  // Laundry finished washing: re-count the pieces (kept separately as washedQuantity).
+  router.patch(
+    '/:docNum/wash',
+    requirePerm('orders.wash'),
+    validate(params, 'params'),
+    validate(countSchema),
+    step(ORDER_STATUS.PICKED_UP, ORDER_STATUS.WASHED, { at: 'washedAt', byId: 'washedById', byName: 'washedByName' }, 'washedQuantity', 'order.washed'),
+  );
+  // Packed and ready for the driver: this count becomes the quantity the client pays for.
+  router.patch(
+    '/:docNum/pack',
+    requirePerm('orders.pack'),
+    validate(params, 'params'),
+    validate(countSchema),
+    step(ORDER_STATUS.WASHED, ORDER_STATUS.PACKED, { at: 'packedAt', byId: 'packedById', byName: 'packedByName' }, 'quantity', 'order.packed'),
+  );
+
   // Delivered: real kv.m per line -> docTotal = sum(kv.m * price).
-  router.patch('/:docNum/deliver', validate(params, 'params'), validate(deliverSchema), (req, res) => {
+  router.patch('/:docNum/deliver', requirePerm('orders.deliver'), validate(params, 'params'), validate(deliverSchema), (req, res) => {
     const { docNum } = req.valid.params;
     const b = req.valid.body;
 
@@ -262,28 +375,36 @@ export function orderRouter(db) {
     db.transaction(() => {
       const order = getOrder.get(docNum);
       if (!order) throw notFound('Order not found');
-      if (order.status !== ORDER_STATUS.PICKED_UP) {
-        throw conflict(`Order is "${order.status}", expected "${ORDER_STATUS.PICKED_UP}"`);
+      if (order.status !== ORDER_STATUS.PACKED) {
+        throw conflict(`Order is "${order.status}", expected "${ORDER_STATUS.PACKED}"`);
       }
       assertAllLines(docNum, b.lines);
+      const discount = b.discount ?? 0;
+      if (discount > 0) needDiscountPerm(req.user);
 
-      const prices = new Map(getLines.all(docNum).map((l) => [l.id, l.price]));
+      const existing = new Map(getLines.all(docNum).map((l) => [l.id, l]));
       const setLine = db.prepare(
         `UPDATE order_lines SET sqm = ?, lineTotal = ?, status = 'Closed' WHERE id = ? AND docNum = ?`,
       );
       let docTotal = 0;
       for (const l of b.lines) {
-        const lineTotal = round2(l.sqm * prices.get(l.id));
+        const line = existing.get(l.id);
+        // per-piece lines are charged by the counted pieces; the others need a measured amount
+        const amount = line.unit === 'dona' ? line.quantity : l.sqm;
+        if (!amount) throw badRequest(`Enter the measured amount (${line.unit}) for "${line.serviceName}"`, { lineId: l.id });
+        const lineTotal = round2(amount * line.price);
         docTotal += lineTotal;
-        setLine.run(l.sqm, lineTotal, l.id, docNum);
+        setLine.run(amount, lineTotal, l.id, docNum);
       }
+      if (discount > round2(docTotal)) throw badRequest('Discount cannot be more than the order total');
       db.prepare(
-        `UPDATE orders SET status = ?, docStatus = 'Closed', docTotal = ?, paid = ?,
+        `UPDATE orders SET status = ?, docStatus = 'Closed', docTotal = ?, discount = ?, paid = ?,
                            deliveredDate = ?, deliveredAt = ?,
                            deliveredById = ?, deliveredByName = ? WHERE docNum = ?`,
       ).run(
         ORDER_STATUS.DELIVERED,
         round2(docTotal),
+        discount,
         b.paid,
         deliveredDate,
         nowDateTime(),
@@ -291,7 +412,11 @@ export function orderRouter(db) {
         req.user.fullName,
         docNum,
       );
-      if (b.paid > 0) insertPayment(docNum, b.paid, deliveredDate, req.user);
+      if (b.paid > 0) insertPayment(docNum, b.paid, deliveredDate, req.user, discount);
+      logActivity(db, req.user, 'order', docNum, 'order.delivered', {
+        from: order.status, to: ORDER_STATUS.DELIVERED, docTotal: round2(docTotal), discount, paid: b.paid,
+        debt: Math.max(round2(docTotal - discount - b.paid), 0), deliveredDate,
+      });
     })();
 
     res.json(loadOrder(docNum));
@@ -306,7 +431,7 @@ export function orderRouter(db) {
   router.get('/cancelled', validate(listQuery, 'query'), listByStatus(ORDER_STATUS.CANCELLED));
 
   // Fix a typo in client / location / pickup time. Only while nobody has picked the order up yet.
-  router.patch('/:docNum', requireRole('admin', 'operator'), validate(params, 'params'), validate(editSchema), (req, res) => {
+  router.patch('/:docNum', requirePerm('orders.edit'), validate(params, 'params'), validate(editSchema), (req, res) => {
     const { docNum } = req.valid.params;
     const b = req.valid.body;
     db.transaction(() => {
@@ -317,11 +442,21 @@ export function orderRouter(db) {
       }
       const name = b.clientName ?? order.clientName;
       const phone = b.clientPhone ?? order.clientPhone;
+      const next = {
+        clientName: name, clientPhone: phone,
+        latitude: b.location?.latitude ?? order.latitude, longitude: b.location?.longitude ?? order.longitude,
+        landmark: b.landmark ?? order.landmark, pickupPlannedAt: b.pickupTime ?? order.pickupPlannedAt,
+      };
+      logActivity(db, req.user, 'order', docNum, 'order.edited', {
+        changes: diff(order, next, ['clientName', 'clientPhone', 'latitude', 'longitude', 'landmark', 'pickupPlannedAt']),
+      });
+      const clientId = clientIdFor(name, phone, req.user);
+      if (b.location) rememberAddress(db, clientId, b.location, b.landmark ?? order.landmark);
       db.prepare(
         `UPDATE orders SET clientId = ?, clientName = ?, clientPhone = ?, latitude = ?, longitude = ?,
                            landmark = ?, pickupPlannedAt = ? WHERE docNum = ?`,
       ).run(
-        clientIdFor(name, phone),
+        clientId,
         name,
         phone,
         b.location?.latitude ?? order.latitude,
@@ -334,36 +469,57 @@ export function orderRouter(db) {
     res.json(loadOrder(docNum));
   });
 
-  router.post('/:docNum/cancel', requireRole('admin', 'operator'), validate(params, 'params'), validate(cancelSchema), (req, res) => {
+  router.post('/:docNum/cancel', requirePerm('orders.edit'), validate(params, 'params'), validate(cancelSchema), (req, res) => {
     const { docNum } = req.valid.params;
     db.transaction(() => {
       const order = getOrder.get(docNum);
       if (!order) throw notFound('Order not found');
-      if (![ORDER_STATUS.RECEIVED, ORDER_STATUS.PICKED_UP].includes(order.status)) {
+      if (![ORDER_STATUS.RECEIVED, ORDER_STATUS.PICKED_UP, ORDER_STATUS.WASHED, ORDER_STATUS.PACKED].includes(order.status)) {
         throw conflict(`Order is "${order.status}" and cannot be cancelled`);
       }
       db.prepare(
         `UPDATE orders SET status = ?, docStatus = 'Closed', cancelReason = ?, cancelledAt = ? WHERE docNum = ?`,
       ).run(ORDER_STATUS.CANCELLED, req.valid.body.reason, nowDateTime(), docNum);
       db.prepare(`UPDATE order_lines SET status = 'Closed' WHERE docNum = ?`).run(docNum);
+      logActivity(db, req.user, 'order', docNum, 'order.cancelled', { from: order.status, to: ORDER_STATUS.CANCELLED, reason: req.valid.body.reason });
     })();
     res.json(loadOrder(docNum));
   });
 
-  // Client pays (part of) the debt of an already delivered order.
-  router.post('/:docNum/payments', requireRole('admin', 'operator'), validate(params, 'params'), validate(paymentSchema), (req, res) => {
+  // Client pays (part of) the debt of an already delivered order, and/or is given a discount on it.
+  router.post('/:docNum/payments', requirePerm('orders.payments'), validate(params, 'params'), validate(paymentSchema), (req, res) => {
     const { docNum } = req.valid.params;
-    const { amount, paidDate } = req.valid.body;
+    const { amount, discount, paidDate } = req.valid.body;
     db.transaction(() => {
       const order = getOrder.get(docNum);
       if (!order) throw notFound('Order not found');
       if (order.status !== ORDER_STATUS.DELIVERED) throw conflict('Payments are only for delivered orders');
-      const debt = round2(order.docTotal - order.paid);
-      if (amount > debt) throw badRequest(`Amount is more than the debt (${debt})`);
-      insertPayment(docNum, amount, paidDate ?? today(), req.user);
-      db.prepare('UPDATE orders SET paid = ? WHERE docNum = ?').run(round2(order.paid + amount), docNum);
+      if (discount > 0) needDiscountPerm(req.user);
+      const debt = round2(order.docTotal - order.discount - order.paid);
+      if (discount > debt) throw badRequest(`Discount is more than the debt (${debt})`);
+      if (amount > round2(debt - discount)) throw badRequest(`Amount is more than the debt left after the discount (${round2(debt - discount)})`);
+      const date = paidDate ?? today();
+      if (amount > 0) insertPayment(docNum, amount, date, req.user, discount);
+      db.prepare('UPDATE orders SET paid = ?, discount = ? WHERE docNum = ?').run(
+        round2(order.paid + amount),
+        round2(order.discount + discount),
+        docNum,
+      );
+      logActivity(db, req.user, 'order', docNum, 'order.payment', {
+        amount, discount, paidDate: date, debtLeft: round2(debt - discount - amount),
+      });
     })();
     res.status(201).json(loadOrder(docNum));
+  });
+
+  // Everything that happened to an order, oldest first.
+  router.get('/:docNum/history', validate(params, 'params'), (req, res) => {
+    const { docNum } = req.valid.params;
+    if (!getOrder.get(docNum)) throw notFound('Order not found');
+    const rows = db
+      .prepare("SELECT * FROM activity_log WHERE entity = 'order' AND entityId = ? ORDER BY id")
+      .all(String(docNum));
+    res.json({ data: rows.map((r) => ({ id: r.id, at: r.at, userId: r.userId, userName: r.userName, action: r.action, details: JSON.parse(r.details) })) });
   });
 
   router.get('/:docNum/payments', validate(params, 'params'), (req, res) => {

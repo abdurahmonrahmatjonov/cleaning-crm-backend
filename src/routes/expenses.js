@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { logActivity } from '../utils/activity.js';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
 import { badRequest } from '../utils/httpError.js';
@@ -42,6 +43,7 @@ export function expensesRouter(db) {
          VALUES (?,?,?,?,?,?,?)`,
       )
       .run(type.id, type.name, b.amount, b.expenseDate, today(), req.user.id, req.user.fullName);
+    logActivity(db, req.user, 'expense', info.lastInsertRowid, 'expense.created', { type: type.name, amount: b.amount, date: b.expenseDate });
     res.status(201).json(present(getExpense.get(info.lastInsertRowid)));
   });
 

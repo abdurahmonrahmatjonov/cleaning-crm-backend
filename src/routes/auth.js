@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
-import { authenticate, signToken } from '../middleware/auth.js';
+import { authenticate, permissionsOf, signToken } from '../middleware/auth.js';
 import { HttpError } from '../utils/httpError.js';
 
 const loginSchema = z.object({ username: z.string().trim().min(1), password: z.string().min(1) });
@@ -14,6 +14,7 @@ const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 10);
 export function authRouter(db, { loginLimit = 10 } = {}) {
   const router = Router();
   const findByUsername = db.prepare('SELECT * FROM users WHERE username = ?');
+  const findRole = db.prepare('SELECT name, permissions FROM roles WHERE key = ?');
 
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -30,13 +31,13 @@ export function authRouter(db, { loginLimit = 10 } = {}) {
     if (!user || !user.isActive || !ok) throw new HttpError(401, 'Wrong username or password');
     res.json({
       token: signToken(user),
-      user: { id: user.id, username: user.username, fullName: user.fullName, role: user.role },
+      user: { id: user.id, username: user.username, fullName: user.fullName, role: user.role, roleName: findRole.get(user.role)?.name ?? user.role, permissions: permissionsOf(findRole, user.role) },
     });
   });
 
   router.get('/me', authenticate(db), (req, res) => {
-    const { id, username, fullName, role } = req.user;
-    res.json({ id, username, fullName, role });
+    const { id, username, fullName, role, permissions } = req.user;
+    res.json({ id, username, fullName, role, roleName: findRole.get(role)?.name ?? role, permissions });
   });
 
   return router;

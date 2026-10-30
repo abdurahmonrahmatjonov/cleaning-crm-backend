@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
-import { requireRole } from '../middleware/auth.js';
+import { requirePerm } from '../middleware/auth.js';
 import { ORDER_STATUS } from '../db.js';
 import { badRequest } from '../utils/httpError.js';
 import { dateString } from '../utils/schemas.js';
@@ -12,7 +12,7 @@ export function reportsRouter(db) {
   const router = Router();
 
   // Money overview for a date range. Admin only.
-  router.get('/summary', requireRole('admin'), validate(rangeQuery, 'query'), (req, res) => {
+  router.get('/summary', requirePerm('reports.view'), validate(rangeQuery, 'query'), (req, res) => {
     const { from, to } = req.valid.query;
     if (from > to) throw badRequest('"from" must not be after "to"');
     const r = { from, to };
@@ -24,14 +24,14 @@ export function reportsRouter(db) {
     // Sales = orders delivered in the range
     const sales = db
       .prepare(
-        `SELECT COUNT(*) ordersCount, COALESCE(SUM(docTotal),0) total
+        `SELECT COUNT(*) ordersCount, COALESCE(SUM(docTotal),0) total, COALESCE(SUM(discount),0) discount
          FROM orders WHERE status = @delivered AND deliveredDate BETWEEN @from AND @to`,
       )
       .get({ ...r, delivered: ORDER_STATUS.DELIVERED });
     const totalSqm = db
       .prepare(
         `SELECT COALESCE(SUM(l.sqm),0) v FROM order_lines l JOIN orders o ON o.docNum = l.docNum
-         WHERE o.status = @delivered AND o.deliveredDate BETWEEN @from AND @to`,
+         WHERE o.status = @delivered AND o.deliveredDate BETWEEN @from AND @to AND l.unit = 'kv.m'`,
       )
       .get({ ...r, delivered: ORDER_STATUS.DELIVERED }).v;
 
@@ -50,7 +50,7 @@ export function reportsRouter(db) {
 
     const outstandingDebt = db
       .prepare(
-        `SELECT COALESCE(SUM(docTotal - paid),0) v FROM orders WHERE status = ? AND docTotal > paid`,
+        `SELECT COALESCE(SUM(docTotal - discount - paid),0) v FROM orders WHERE status = ? AND docTotal - discount > paid`,
       )
       .get(ORDER_STATUS.DELIVERED).v;
 
@@ -58,7 +58,7 @@ export function reportsRouter(db) {
       from,
       to,
       ordersByStatus,
-      sales: { ordersCount: sales.ordersCount, total: sales.total, totalSqm },
+      sales: { ordersCount: sales.ordersCount, total: sales.total, discount: sales.discount, totalSqm },
       collected,
       expenses: { total: expensesTotal, byType: expensesByType },
       netCash: collected - expensesTotal, // money in minus money out
@@ -67,12 +67,12 @@ export function reportsRouter(db) {
   });
 
   // Clients who still owe money.
-  router.get('/debtors', requireRole('admin', 'operator'), (_req, res) => {
+  router.get('/debtors', requirePerm('debtors.view'), (_req, res) => {
     const rows = db
       .prepare(
-        `SELECT c.id clientId, c.name, c.phone, COUNT(*) ordersCount, SUM(o.docTotal - o.paid) debt
+        `SELECT c.id clientId, c.name, c.phone, COUNT(*) ordersCount, SUM(o.docTotal - o.discount - o.paid) debt
          FROM orders o JOIN clients c ON c.id = o.clientId
-         WHERE o.status = ? AND o.docTotal > o.paid GROUP BY c.id ORDER BY debt DESC`,
+         WHERE o.status = ? AND o.docTotal - o.discount > o.paid GROUP BY c.id ORDER BY debt DESC`,
       )
       .all(ORDER_STATUS.DELIVERED);
     res.json({ data: rows, meta: { totalDebt: rows.reduce((a, r) => a + r.debt, 0) } });

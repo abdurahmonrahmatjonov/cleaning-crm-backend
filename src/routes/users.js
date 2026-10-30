@@ -1,13 +1,14 @@
 import { Router } from 'express';
+import { diff, logActivity } from '../utils/activity.js';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
 import { requireRole } from '../middleware/auth.js';
-import { conflict, notFound } from '../utils/httpError.js';
+import { badRequest, conflict, notFound } from '../utils/httpError.js';
 import { id as idSchema } from '../utils/schemas.js';
 import { nowDateTime } from '../utils/time.js';
 
-const role = z.enum(['admin', 'operator', 'driver']);
+const role = z.string().regex(/^[a-z0-9_]{1,40}$/);
 const password = z.string().min(8).max(100);
 
 const createSchema = z.object({
@@ -32,6 +33,9 @@ const publicCols = 'id, username, fullName, role, isActive, createdAt';
 export function usersRouter(db) {
   const router = Router();
   router.use(requireRole('admin'));
+  const assertRole = (key) => {
+    if (key !== undefined && !db.prepare('SELECT 1 FROM roles WHERE key = ?').get(key)) throw badRequest('Unknown role');
+  };
 
   router.get('/', (_req, res) => {
     res.json({ data: db.prepare(`SELECT ${publicCols} FROM users ORDER BY id`).all() });
@@ -39,11 +43,14 @@ export function usersRouter(db) {
 
   router.post('/', validate(createSchema), (req, res) => {
     const { username, fullName, password: pw, role: r } = req.valid.body;
+    assertRole(r);
     try {
       const info = db
         .prepare('INSERT INTO users (username, fullName, passwordHash, role, createdAt) VALUES (?,?,?,?,?)')
         .run(username, fullName, bcrypt.hashSync(pw, 10), r, nowDateTime());
-      res.status(201).json(db.prepare(`SELECT ${publicCols} FROM users WHERE id = ?`).get(info.lastInsertRowid));
+      const created = db.prepare(`SELECT ${publicCols} FROM users WHERE id = ?`).get(info.lastInsertRowid);
+      logActivity(db, req.user, 'user', created.id, 'user.created', { username: created.username, fullName: created.fullName, role: created.role });
+      res.status(201).json(created);
     } catch (e) {
       if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') throw conflict('Username already exists');
       throw e;
@@ -53,6 +60,7 @@ export function usersRouter(db) {
   router.patch('/:id', validate(params, 'params'), validate(patchSchema), (req, res) => {
     const { id } = req.valid.params;
     const { password: pw, isActive, ...rest } = req.valid.body;
+    assertRole(rest.role);
     const sets = { ...rest };
     if (pw) sets.passwordHash = bcrypt.hashSync(pw, 10);
     if (isActive !== undefined) sets.isActive = isActive ? 1 : 0;
@@ -60,12 +68,19 @@ export function usersRouter(db) {
     if (id === req.user.id && (sets.isActive === 0 || (sets.role && sets.role !== 'admin'))) {
       throw conflict('You cannot disable or demote your own account');
     }
+    const before = db.prepare(`SELECT ${publicCols} FROM users WHERE id = ?`).get(id);
     const cols = Object.keys(sets);
     const info = db
       .prepare(`UPDATE users SET ${cols.map((c) => `${c} = @${c}`).join(', ')} WHERE id = @id`)
       .run({ ...sets, id });
     if (!info.changes) throw notFound('User not found');
-    res.json(db.prepare(`SELECT ${publicCols} FROM users WHERE id = ?`).get(id));
+    const after = db.prepare(`SELECT ${publicCols} FROM users WHERE id = ?`).get(id);
+    logActivity(db, req.user, 'user', id, 'user.updated', {
+      username: after.username,
+      changes: diff(before, after, ['fullName', 'role', 'isActive']),
+      passwordChanged: !!pw, // never the password itself
+    });
+    res.json(after);
   });
 
   return router;
