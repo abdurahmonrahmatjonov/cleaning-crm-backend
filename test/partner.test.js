@@ -7,6 +7,7 @@ const { createApp } = await import('../src/app.js');
 
 let server, base, db;
 let admin, operator, driver, packer;
+let partnerA, partnerB, clientA, clientB; // saygak tokens and client ids, shared with later tests
 
 const call = async (method, path, { token, body } = {}) => {
   const res = await fetch(base + path, {
@@ -120,4 +121,128 @@ test('sizes: invalid input and non kv.m lines are rejected', async () => {
   for (const bad of [{ width: -1, length: 1 }, { width: 0, length: 1 }, { width: 101, length: 1 }, { width: 0.001, length: 1 }]) {
     assert.equal((await wash(k, [{ id: k.lines[0].id, quantity: 2, sizes: [bad] }])).status, 400, JSON.stringify(bad));
   }
+});
+
+// Creates a partner client with prices and a login; returns { client, token }.
+const makePartner = async (name, phone, username, prices = [{ serviceId: 1, price: 6000 }]) => {
+  const client = (await call('POST', '/api/clients', { token: operator, body: { name, phone } })).body;
+  assert.equal((await call('PATCH', `/api/clients/${client.id}`, { token: operator, body: { isPartner: true } })).status, 200);
+  assert.equal((await call('PUT', `/api/clients/${client.id}/prices`, { token: admin, body: { prices } })).status, 200);
+  assert.equal((await call('PUT', `/api/clients/${client.id}/login`, { token: admin, body: { username, password: 'password123' } })).status, 200);
+  return { client, token: await login(username, 'password123') };
+};
+
+test('partner setup: admin-only prices/logins, role locked, token revoked on deactivate', async () => {
+  const mk = async (name, phone) => (await call('POST', '/api/clients', { token: operator, body: { name, phone } })).body;
+  const A = await mk('Saygak A', '+998901111111');
+  assert.equal((await call('PUT', `/api/clients/${A.id}/prices`, { token: operator, body: { prices: [{ serviceId: 1, price: 6000 }] } })).status, 403);
+  assert.equal((await call('PUT', `/api/clients/${A.id}/prices`, { token: admin, body: { prices: [{ serviceId: 1, price: 6000 }] } })).status, 409); // not a partner yet
+  assert.equal((await call('PUT', `/api/clients/${A.id}/login`, { token: admin, body: { username: 'saygakA', password: 'password123' } })).status, 409);
+  assert.equal((await call('PATCH', `/api/clients/${A.id}`, { token: operator, body: { isPartner: true } })).status, 200);
+  assert.equal((await call('PUT', `/api/clients/${A.id}/prices`, { token: admin, body: { prices: [{ serviceId: 1, price: 6000 }] } })).status, 200);
+  assert.equal((await call('PUT', `/api/clients/${A.id}/login`, { token: operator, body: { username: 'saygakA', password: 'password123' } })).status, 403);
+  assert.equal((await call('PUT', `/api/clients/${A.id}/login`, { token: admin, body: { username: 'saygakA', password: 'password123' } })).status, 200);
+  const t = await login('saygakA', 'password123');
+  const me = await call('GET', '/api/auth/me', { token: t });
+  assert.equal(me.body.clientId, A.id);
+  assert.equal((await call('GET', '/api/users', { token: admin })).body.data.some((u) => u.role === 'saygak'), false);
+  assert.equal((await call('POST', '/api/users', { token: admin, body: { username: 'x1x', fullName: 'x', password: 'password123', role: 'saygak' } })).status, 400);
+  assert.equal((await call('PATCH', '/api/roles/saygak', { token: admin, body: { permissions: ['expenses.manage'] } })).status, 409);
+  assert.equal((await call('PATCH', `/api/clients/${A.id}/login`, { token: admin, body: { isActive: false } })).status, 200);
+  assert.equal((await call('GET', '/api/auth/me', { token: t })).status, 401);
+});
+
+test('partner setup: makePartner fixtures, login endpoints, prices listing', async () => {
+  ({ client: { id: clientA }, token: partnerA } = await makePartner('Saygak PA', '+998902222221', 'partnerA', [{ serviceId: 1, price: 6000 }]));
+  ({ client: { id: clientB }, token: partnerB } = await makePartner('Saygak PB', '+998902222222', 'partnerB', [{ serviceId: 1, price: 7000 }]));
+  const me = await call('GET', '/api/auth/me', { token: partnerA });
+  assert.equal(me.body.clientId, clientA);
+  assert.equal(me.body.role, 'saygak');
+  const lg = await call('POST', '/api/auth/login', { body: { username: 'partnerB', password: 'password123' } });
+  assert.equal(lg.body.user.clientId, clientB);
+  assert.equal((await call('GET', '/api/auth/me', { token: operator })).body.clientId, null);
+  assert.equal((await call('POST', '/api/auth/login', { body: { username: 'oper', password: 'password123' } })).body.user.clientId, null);
+
+  const prices = (await call('GET', `/api/clients/${clientA}/prices`, { token: operator })).body.data;
+  assert.equal(prices.find((p) => p.serviceId === 1).price, 6000);
+  assert.equal(prices.find((p) => p.serviceId === 2).price, null);
+  assert.ok(prices[0].serviceName && prices[0].unit);
+  // replace set: serviceId 1 dropped, 2 added
+  assert.equal((await call('PUT', `/api/clients/${clientB}/prices`, { token: admin, body: { prices: [{ serviceId: 2, price: 5000 }] } })).status, 200);
+  const after = (await call('GET', `/api/clients/${clientB}/prices`, { token: operator })).body.data;
+  assert.equal(after.find((p) => p.serviceId === 1).price, null);
+  assert.equal(after.find((p) => p.serviceId === 2).price, 5000);
+  assert.equal((await call('PUT', `/api/clients/${clientB}/prices`, { token: admin, body: { prices: [{ serviceId: 1, price: 7000 }] } })).status, 200);
+  const log = db.prepare("SELECT details FROM activity_log WHERE action = 'client.prices' AND entityId = ?").all(String(clientB));
+  assert.ok(log.length >= 2);
+  assert.ok(!JSON.stringify(log).includes('password'));
+  // validation
+  assert.equal((await call('PUT', `/api/clients/${clientB}/prices`, { token: admin, body: { prices: [{ serviceId: 9999, price: 1 }] } })).status, 400);
+  assert.equal((await call('PUT', `/api/clients/${clientB}/prices`, { token: admin, body: { prices: [{ serviceId: 1, price: 1 }, { serviceId: 1, price: 2 }] } })).status, 400);
+  assert.equal((await call('PUT', `/api/clients/${clientB}/prices`, { token: admin, body: { prices: [{ serviceId: 1, price: -1 }] } })).status, 400);
+
+  // login: GET, reset, uniqueness, deactivate/reactivate
+  const g = await call('GET', `/api/clients/${clientA}/login`, { token: admin });
+  assert.deepEqual(g.body, { username: 'partnerA', isActive: true });
+  assert.equal((await call('GET', `/api/clients/${clientA}/login`, { token: operator })).status, 403);
+  const plain = (await call('POST', '/api/clients', { token: operator, body: { name: 'Plain', phone: '+998903333331' } })).body;
+  assert.equal((await call('GET', `/api/clients/${plain.id}/login`, { token: admin })).body, null);
+  assert.equal((await call('PUT', `/api/clients/${clientA}/login`, { token: admin, body: { username: 'partnerB', password: 'password123' } })).status, 409);
+  assert.equal((await call('PUT', `/api/clients/${clientA}/login`, { token: admin, body: { username: 'oper', password: 'password123' } })).status, 409);
+  assert.equal((await call('PUT', `/api/clients/${clientA}/login`, { token: admin, body: { username: 'partnerA', password: 'short' } })).status, 400);
+  const reset = await call('PUT', `/api/clients/${clientA}/login`, { token: admin, body: { username: 'partnerA', password: 'newpassword1' } });
+  assert.equal(reset.status, 200);
+  assert.deepEqual(reset.body, { username: 'partnerA', isActive: true });
+  assert.equal((await call('POST', '/api/auth/login', { body: { username: 'partnerA', password: 'password123' } })).status, 401);
+  partnerA = await login('partnerA', 'newpassword1');
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM users WHERE clientId = ?").get(clientA).n, 1);
+  assert.equal((await call('PATCH', `/api/clients/${plain.id}/login`, { token: admin, body: { isActive: false } })).status, 404);
+  assert.equal((await call('PATCH', `/api/clients/${clientB}/login`, { token: admin, body: { isActive: false } })).status, 200);
+  assert.equal((await call('POST', '/api/auth/login', { body: { username: 'partnerB', password: 'password123' } })).status, 401);
+  assert.equal((await call('PATCH', `/api/clients/${clientB}/login`, { token: admin, body: { isActive: true } })).status, 200);
+  partnerB = await login('partnerB', 'password123');
+  // no password / hash ever in logs or responses
+  const logs = JSON.stringify(db.prepare("SELECT details FROM activity_log WHERE action LIKE 'client.login%'").all());
+  assert.ok(logs.includes('client.login') || logs.length > 2);
+  assert.ok(!/password123|newpassword1|\$2[aby]\$/.test(logs));
+  assert.ok(!JSON.stringify(g.body).includes('Hash'));
+  assert.equal((await call('DELETE', `/api/clients/${clientA}`, { token: admin })).status, 409); // has a login: never a 500
+  // isPartner exposed on get + list
+  assert.equal((await call('GET', `/api/clients/${clientA}`, { token: operator })).body.isPartner, 1);
+  const list = (await call('GET', '/api/clients?limit=100', { token: operator })).body.data;
+  assert.equal(list.find((c) => c.id === clientA).isPartner, 1);
+  assert.equal(list.find((c) => c.id === plain.id).isPartner, 0);
+});
+
+test('partner setup: users API cannot touch saygak users, roles locked, no clientId accepted', async () => {
+  const sayId = db.prepare('SELECT id FROM users WHERE clientId = ?').get(clientA).id;
+  const patch = (body) => call('PATCH', `/api/users/${sayId}`, { token: admin, body });
+  assert.equal((await patch({ fullName: 'Hacked' })).status, 400);
+  assert.equal((await patch({ password: 'password999' })).status, 400);
+  const opId = db.prepare("SELECT id FROM users WHERE username = 'oper'").get().id;
+  assert.equal((await call('PATCH', `/api/users/${opId}`, { token: admin, body: { role: 'saygak' } })).status, 400);
+  // clientId is not an accepted field: it is ignored or rejected, never applied
+  await call('PATCH', `/api/users/${opId}`, { token: admin, body: { clientId: clientB } });
+  await call('POST', '/api/users', { token: admin, body: { username: 'withcid', fullName: 'x', password: 'password123', role: 'operator', clientId: clientB } });
+  assert.equal(db.prepare('SELECT clientId FROM users WHERE id = ?').get(opId).clientId, null);
+  assert.equal(db.prepare("SELECT clientId FROM users WHERE username = 'withcid'").get()?.clientId ?? null, null);
+  // roles
+  assert.equal((await call('DELETE', '/api/roles/saygak', { token: admin })).status, 409);
+  assert.equal((await call('PATCH', '/api/roles/saygak', { token: admin, body: { name: 'Hijack' } })).status, 409);
+  assert.equal((await call('POST', '/api/roles', { token: admin, body: { name: 'Saygak', permissions: [] } })).status, 409);
+  assert.equal((await call('POST', '/api/roles', { token: admin, body: { name: 'SAYGAK!', permissions: [] } })).status, 409);
+  const r = db.prepare("SELECT name, isSystem, permissions FROM roles WHERE key = 'saygak'").get();
+  assert.deepEqual(r, { name: 'Saygak', isSystem: 1, permissions: '[]' });
+});
+
+test('migration fix-up locks a pre-existing custom saygak role', () => {
+  const path = `${process.env.TMPDIR || '/tmp'}/saygak-lock-${process.pid}.db`;
+  const d = openDb(path);
+  d.prepare("DELETE FROM settings WHERE key = 'saygak_role_locked'").run();
+  d.prepare("UPDATE roles SET isSystem = 0, permissions = '[\"expenses.manage\"]', name = 'Custom' WHERE key = 'saygak'").run();
+  d.close();
+  const d2 = openDb(path);
+  assert.deepEqual(d2.prepare("SELECT name, isSystem, permissions FROM roles WHERE key = 'saygak'").get(), { name: 'Saygak', isSystem: 1, permissions: '[]' });
+  d2.close();
+  for (const f of [path, `${path}-wal`, `${path}-shm`]) { try { process.getBuiltinModule('fs').unlinkSync(f); } catch {} }
 });

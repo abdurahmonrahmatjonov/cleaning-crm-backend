@@ -18,7 +18,7 @@ export const signToken = (user) =>
 
 /** Verifies the Bearer token and loads the (still active) user from the DB on every request. */
 export const authenticate = (db) => {
-  const findUser = db.prepare('SELECT id, username, fullName, role, isActive FROM users WHERE id = ?');
+  const findUser = db.prepare('SELECT id, username, fullName, role, isActive, clientId FROM users WHERE id = ?');
   const findRole = db.prepare('SELECT permissions FROM roles WHERE key = ?');
   return (req, _res, next) => {
     const header = req.headers.authorization || '';
@@ -28,7 +28,7 @@ export const authenticate = (db) => {
       const payload = jwt.verify(token, config.jwtSecret);
       const user = findUser.get(payload.sub);
       if (!user || !user.isActive) return next(new HttpError(401, 'Invalid or disabled user'));
-      req.user = { ...user, permissions: permissionsOf(findRole, user.role) };
+      req.user = { ...user, permissions: permissionsOf(findRole, user.role), clientId: user.clientId ?? null };
       next();
     } catch {
       next(new HttpError(401, 'Invalid or expired token'));

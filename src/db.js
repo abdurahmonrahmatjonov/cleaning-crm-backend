@@ -349,6 +349,8 @@ function migrate(db) {
       WHEN (NEW.role = 'saygak') != (NEW.clientId IS NOT NULL)
       BEGIN SELECT RAISE(ABORT, 'saygak role and clientId must go together'); END;
   `);
+  // the saygak role is fixed: also covers a DB where an admin had already created a custom role with this key
+  once('saygak_role_locked', () => db.prepare("UPDATE roles SET isSystem = 1, permissions = '[]', name = 'Saygak' WHERE key = 'saygak'").run());
   // 3. built-in roles (never overwrite permissions an admin has already edited)
   const ins = db.prepare('INSERT OR IGNORE INTO roles (key, name, permissions, isSystem) VALUES (?,?,?,?)');
   for (const r of DEFAULT_ROLES) ins.run(r.key, r.name, JSON.stringify(r.permissions), r.isSystem);

@@ -45,6 +45,7 @@ export function rolesRouter(db) {
 
   router.post('/', validate(createSchema), (req, res) => {
     const { name: n, permissions: perms } = req.valid.body;
+    if (slug(n) === 'saygak') throw conflict('The saygak role is fixed');
     let key = slug(n);
     for (let i = 2; get(key); i++) key = `${slug(n).slice(0, 26)}_${i}`;
     try {
@@ -61,6 +62,7 @@ export function rolesRouter(db) {
     const { key } = req.valid.params;
     const role = get(key);
     if (!role) throw notFound('Role not found');
+    if (key === 'saygak') throw conflict('The saygak role is fixed');
     if (key === 'admin') throw conflict('The admin role cannot be changed');
     const { name: n, permissions: perms } = req.valid.body;
     try {
@@ -83,6 +85,7 @@ export function rolesRouter(db) {
     const { key } = req.valid.params;
     const role = get(key);
     if (!role) throw notFound('Role not found');
+    if (key === 'saygak') throw conflict('The saygak role is fixed');
     if (role.isSystem) throw conflict('Built-in roles cannot be deleted');
     if (db.prepare('SELECT COUNT(*) c FROM users WHERE role = ?').get(key).c > 0) {
       throw conflict('Some users still have this role; move them to another role first');

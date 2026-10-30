@@ -28,17 +28,19 @@ const patchSchema = z
   .refine((o) => Object.keys(o).length > 0, 'Nothing to update');
 const params = z.object({ id: idSchema });
 
+const SAYGAK_MSG = 'Saygak accounts are managed from the client profile';
 const publicCols = 'id, username, fullName, role, isActive, createdAt';
 
 export function usersRouter(db) {
   const router = Router();
   router.use(requireRole('admin'));
   const assertRole = (key) => {
+    if (key === 'saygak') throw badRequest(SAYGAK_MSG);
     if (key !== undefined && !db.prepare('SELECT 1 FROM roles WHERE key = ?').get(key)) throw badRequest('Unknown role');
   };
 
   router.get('/', (_req, res) => {
-    res.json({ data: db.prepare(`SELECT ${publicCols} FROM users ORDER BY id`).all() });
+    res.json({ data: db.prepare(`SELECT ${publicCols} FROM users WHERE role != 'saygak' ORDER BY id`).all() });
   });
 
   router.post('/', validate(createSchema), (req, res) => {
@@ -59,6 +61,8 @@ export function usersRouter(db) {
 
   router.patch('/:id', validate(params, 'params'), validate(patchSchema), (req, res) => {
     const { id } = req.valid.params;
+    const target = db.prepare('SELECT role FROM users WHERE id = ?').get(id);
+    if (target?.role === 'saygak') throw badRequest(SAYGAK_MSG);
     const { password: pw, isActive, ...rest } = req.valid.body;
     assertRole(rest.role);
     const sets = { ...rest };

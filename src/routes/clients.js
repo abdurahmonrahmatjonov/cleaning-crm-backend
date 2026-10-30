@@ -1,9 +1,10 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
-import { requirePerm } from '../middleware/auth.js';
+import bcrypt from 'bcryptjs';
+import { requirePerm, requireRole } from '../middleware/auth.js';
 import { ORDER_STATUS } from '../db.js';
-import { conflict, notFound } from '../utils/httpError.js';
+import { badRequest, conflict, notFound } from '../utils/httpError.js';
 import { id as idSchema, pagination, phoneString } from '../utils/schemas.js';
 import { diff, logActivity } from '../utils/activity.js';
 import { presentAddress, rememberAddress } from '../utils/addresses.js';
@@ -16,9 +17,26 @@ const addressParams = z.object({ id: idSchema, addressId: idSchema });
 const name = z.string().trim().min(1).max(150);
 const createSchema = z.object({ name, phone: phoneString, address: addressInput().optional() });
 const patchSchema = z
-  .object({ name, phone: phoneString })
+  .object({ name, phone: phoneString, isPartner: z.boolean() })
   .partial()
   .refine((o) => Object.keys(o).length > 0, 'Nothing to update');
+
+const pricesSchema = z
+  .object({
+    prices: z
+      .array(z.object({ serviceId: idSchema, price: z.number().finite().min(0).max(1e9) }))
+      .max(500)
+      .refine((a) => new Set(a.map((p) => p.serviceId)).size === a.length, 'Duplicate service'),
+  })
+  .strict();
+const loginSchema = z
+  .object({
+    username: z.string().trim().min(3).max(50).regex(/^[\w.-]+$/, 'Letters, digits, _ . - only'),
+    fullName: z.string().trim().min(1).max(100).optional(),
+    password: z.string().min(8).max(100),
+  })
+  .strict();
+const loginPatchSchema = z.object({ isActive: z.boolean() }).strict();
 
 function addressInput() {
   return z.object({ latitude: z.number().min(-90).max(90), longitude: z.number().min(-180).max(180), landmark: z.string().trim().max(300).default('') });
@@ -38,7 +56,7 @@ export function clientsRouter(db) {
   const summary = (id) =>
     db
       .prepare(
-        `SELECT c.id, c.name, c.phone, c.createdAt, COUNT(o.docNum) ordersCount, ${DEBT_SQL} debt
+        `SELECT c.id, c.name, c.phone, c.isPartner, c.createdAt, COUNT(o.docNum) ordersCount, ${DEBT_SQL} debt
          FROM clients c LEFT JOIN orders o ON o.clientId = c.id WHERE c.id = @id GROUP BY c.id`,
       )
       .get({ ...base, id });
@@ -65,7 +83,7 @@ export function clientsRouter(db) {
     const total = db.prepare(`SELECT COUNT(*) c FROM clients c ${where}`).get(args).c;
     const rows = db
       .prepare(
-        `SELECT c.id, c.name, c.phone, c.createdAt, COUNT(o.docNum) ordersCount, ${DEBT_SQL} debt
+        `SELECT c.id, c.name, c.phone, c.isPartner, c.createdAt, COUNT(o.docNum) ordersCount, ${DEBT_SQL} debt
          FROM clients c LEFT JOIN orders o ON o.clientId = c.id
          ${where} GROUP BY c.id ORDER BY c.id DESC LIMIT @limit OFFSET @offset`,
       )
@@ -103,15 +121,98 @@ export function clientsRouter(db) {
   router.patch('/:id', manage, validate(params, 'params'), validate(patchSchema), (req, res) => {
     const { id } = req.valid.params;
     const before = getClient(id);
-    const next = { name: req.valid.body.name ?? before.name, phone: req.valid.body.phone ?? before.phone };
+    const b = req.valid.body;
+    const next = { name: b.name ?? before.name, phone: b.phone ?? before.phone, isPartner: b.isPartner === undefined ? before.isPartner : b.isPartner ? 1 : 0 };
     try {
       db.transaction(() => {
-        db.prepare('UPDATE clients SET name = ?, phone = ? WHERE id = ?').run(next.name, next.phone, id);
+        db.prepare('UPDATE clients SET name = ?, phone = ?, isPartner = ? WHERE id = ?').run(next.name, next.phone, next.isPartner, id);
         db.prepare('UPDATE orders SET clientName = ?, clientPhone = ? WHERE clientId = ?').run(next.name, next.phone, id);
-        logActivity(db, req.user, 'client', id, 'client.updated', { changes: diff(before, next, ['name', 'phone']) });
+        logActivity(db, req.user, 'client', id, 'client.updated', { changes: diff(before, next, ['name', 'phone', 'isPartner']) });
       })();
     } catch (e) { dup(e); }
     res.json({ ...summary(id), addresses: addressesOf(id) });
+  });
+
+  // ----- saygak (partner) prices and login: admin only -----
+  const adminOnly = requireRole('admin');
+  const getPartner = (id) => {
+    const c = getClient(id);
+    if (!c.isPartner) throw conflict('This client is not a saygak');
+    return c;
+  };
+  const pricesOf = (id) =>
+    db
+      .prepare(
+        `SELECT s.id serviceId, s.name serviceName, s.unit, p.price
+         FROM services s LEFT JOIN client_prices p ON p.serviceId = s.id AND p.clientId = ?
+         WHERE s.isActive = 1 ORDER BY s.id`,
+      )
+      .all(id);
+
+  router.get('/:id/prices', validate(params, 'params'), (req, res) => {
+    getClient(req.valid.params.id);
+    res.json({ data: pricesOf(req.valid.params.id) });
+  });
+
+  router.put('/:id/prices', adminOnly, validate(params, 'params'), validate(pricesSchema), (req, res) => {
+    const { id } = req.valid.params;
+    getPartner(id);
+    const next = req.valid.body.prices;
+    for (const p of next) if (!db.prepare('SELECT 1 FROM services WHERE id = ?').get(p.serviceId)) throw badRequest('Unknown service', { path: 'prices' });
+    db.transaction(() => {
+      const old = new Map(db.prepare('SELECT serviceId, price FROM client_prices WHERE clientId = ?').all(id).map((r) => [r.serviceId, r.price]));
+      db.prepare('DELETE FROM client_prices WHERE clientId = ?').run(id);
+      const ins = db.prepare('INSERT INTO client_prices (clientId, serviceId, price) VALUES (?,?,?)');
+      for (const p of next) ins.run(id, p.serviceId, p.price);
+      const changes = [];
+      for (const p of next) if (old.get(p.serviceId) !== p.price) changes.push({ serviceId: p.serviceId, from: old.get(p.serviceId) ?? null, to: p.price });
+      for (const [serviceId, price] of old) if (!next.some((p) => p.serviceId === serviceId)) changes.push({ serviceId, from: price, to: null });
+      logActivity(db, req.user, 'client', id, 'client.prices', { changes });
+    })();
+    res.json({ data: pricesOf(id) });
+  });
+
+  const loginOf = (id) => {
+    const u = db.prepare('SELECT username, isActive FROM users WHERE clientId = ?').get(id);
+    return u ? { username: u.username, isActive: !!u.isActive } : null;
+  };
+
+  router.get('/:id/login', adminOnly, validate(params, 'params'), (req, res) => {
+    getClient(req.valid.params.id);
+    res.json(loginOf(req.valid.params.id));
+  });
+
+  router.put('/:id/login', adminOnly, validate(params, 'params'), validate(loginSchema), (req, res) => {
+    const { id } = req.valid.params;
+    const client = getPartner(id);
+    const { username, fullName, password } = req.valid.body;
+    const hash = bcrypt.hashSync(password, 10);
+    try {
+      db.transaction(() => {
+        const existing = db.prepare('SELECT id, username FROM users WHERE clientId = ?').get(id);
+        if (existing) {
+          db.prepare('UPDATE users SET username = ?, passwordHash = ?, fullName = COALESCE(?, fullName) WHERE id = ?').run(username, hash, fullName ?? null, existing.id);
+          logActivity(db, req.user, 'client', id, 'client.login.reset', { username, previousUsername: existing.username, passwordChanged: true });
+        } else {
+          db.prepare("INSERT INTO users (username, fullName, passwordHash, role, createdAt, clientId) VALUES (?,?,?,'saygak',?,?)").run(username, fullName ?? client.name, hash, nowDateTime(), id);
+          logActivity(db, req.user, 'client', id, 'client.login.created', { username });
+        }
+      })();
+    } catch (e) {
+      if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') throw conflict('Username already exists');
+      throw e;
+    }
+    res.json(loginOf(id));
+  });
+
+  router.patch('/:id/login', adminOnly, validate(params, 'params'), validate(loginPatchSchema), (req, res) => {
+    const { id } = req.valid.params;
+    getClient(id);
+    const u = db.prepare('SELECT id, username FROM users WHERE clientId = ?').get(id);
+    if (!u) throw notFound('This client has no login');
+    db.prepare('UPDATE users SET isActive = ? WHERE id = ?').run(req.valid.body.isActive ? 1 : 0, u.id);
+    logActivity(db, req.user, 'client', id, 'client.login.active', { username: u.username, isActive: req.valid.body.isActive });
+    res.json(loginOf(id));
   });
 
   // Only clients with no orders can go; the rest keep their history.
@@ -120,6 +221,9 @@ export function clientsRouter(db) {
     const c = getClient(id);
     if (db.prepare('SELECT COUNT(*) n FROM orders WHERE clientId = ?').get(id).n > 0) {
       throw conflict('This client has orders and cannot be deleted');
+    }
+    if (db.prepare('SELECT 1 FROM users WHERE clientId = ?').get(id) || db.prepare('SELECT 1 FROM client_prices WHERE clientId = ?').get(id)) {
+      throw conflict('This saygak has a login or prices and cannot be deleted; deactivate the login instead');
     }
     db.transaction(() => {
       db.prepare('DELETE FROM comments WHERE entity = ? AND entityId = ?').run('client', String(id));
