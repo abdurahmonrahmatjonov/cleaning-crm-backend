@@ -495,3 +495,39 @@ test('partner order: 11th open order is 409', async () => {
   const { createPartnerOrder } = await import('../src/routes/orders.js');
   assert.equal(typeof createPartnerOrder, 'function');
 });
+
+test('order edit cannot re-point orders between partner and regular clients', async () => {
+  const { client: sg } = await makePartner('Saygak Edit', '+998902222261', 'editP');
+  const cid = (docNum) => db.prepare('SELECT clientId FROM orders WHERE docNum = ?').get(docNum).clientId;
+  const edit = (docNum, body) => call('PATCH', `/api/orders/${docNum}`, { token: operator, body });
+
+  // partner order: identity/address edits rejected, clientId untouched
+  const po = (await partnerOrder(sg.id)).body;
+  for (const body of [{ clientPhone: '+998902222262' }, { clientName: 'Someone Else' }, { landmark: 'x' }, { location: { latitude: 41, longitude: 69 } }]) {
+    assert.equal((await edit(po.docNum, body)).status, 409);
+  }
+  assert.equal(cid(po.docNum), sg.id);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM clients WHERE phone = ?').get('+998902222262').c, 0);
+  assert.equal((await edit(po.docNum, { pickupTime: '2026-11-05T10:00' })).status, 200);
+  assert.equal(cid(po.docNum), sg.id);
+
+  // regular order: phone of a saygak is refused, nothing written
+  const ro = (await call('POST', '/api/orders', { token: operator, body: newOrder({ clientName: 'Regular Edit', clientPhone: '+998902222263' }) })).body;
+  const before = cid(ro.docNum);
+  const clientsBefore = db.prepare('SELECT COUNT(*) c FROM clients').get().c;
+  const r = await edit(ro.docNum, { clientPhone: '+998902222261' });
+  assert.equal(r.status, 409);
+  assert.equal(cid(ro.docNum), before);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM clients').get().c, clientsBefore);
+  assert.equal(db.prepare('SELECT clientPhone FROM orders WHERE docNum = ?').get(ro.docNum).clientPhone, '+998902222263');
+  // a normal phone change on a regular order still works
+  assert.equal((await edit(ro.docNum, { clientPhone: '+998902222264' })).status, 200);
+});
+
+test('staff create by name+phone detects an existing partner', async () => {
+  await makePartner('Saygak ByPhone', '+998902222271', 'byPhoneP', [{ serviceId: 1, price: 6500 }]);
+  const r = await call('POST', '/api/orders', { token: operator, body: { clientName: 'Typed Name', clientPhone: '+998902222271', lines: [{ serviceId: 1, price: 1 }] } });
+  assert.equal(r.status, 201);
+  assert.equal(r.body.kind, 'partner');
+  assert.equal(r.body.lines[0].price, 6500);
+});

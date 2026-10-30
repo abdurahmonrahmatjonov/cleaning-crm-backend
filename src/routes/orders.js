@@ -530,7 +530,9 @@ export function orderRouter(db) {
       if (order.status !== ORDER_STATUS.RECEIVED) {
         throw conflict(`Only "${ORDER_STATUS.RECEIVED}" orders can be edited`);
       }
-      if (order.kind === 'partner' && b.location) throw conflict('Saygak orders have no address');
+      if (order.kind === 'partner' && ['clientName', 'clientPhone', 'landmark', 'location'].some((k) => b[k] !== undefined)) {
+        throw conflict('Saygak orders are edited on the client page');
+      }
       const name = b.clientName ?? order.clientName;
       const phone = b.clientPhone ?? order.clientPhone;
       const next = {
@@ -542,6 +544,9 @@ export function orderRouter(db) {
         changes: diff(order, next, ['clientName', 'clientPhone', 'latitude', 'longitude', 'landmark', 'pickupPlannedAt']),
       });
       const clientId = clientIdFor(name, phone, req.user);
+      if (order.kind !== 'partner' && db.prepare('SELECT isPartner FROM clients WHERE id = ?').get(clientId)?.isPartner) {
+        throw conflict('This phone belongs to a saygak; create a saygak order instead');
+      }
       if (b.location) rememberAddress(db, clientId, b.location, b.landmark ?? order.landmark);
       db.prepare(
         `UPDATE orders SET clientId = ?, clientName = ?, clientPhone = ?, latitude = ?, longitude = ?,
