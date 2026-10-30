@@ -41,6 +41,7 @@ export const DEFAULT_ROLES = [
   },
   { key: 'driver', name: 'Haydovchi', isSystem: 1, permissions: ['orders.view', 'orders.pickup', 'orders.deliver', 'clients.view'] },
   { key: 'packer', name: 'Upakovkachi', isSystem: 1, permissions: ['orders.view', 'orders.wash', 'orders.pack'] },
+  { key: 'saygak', name: 'Saygak', isSystem: 1, permissions: [] },
 ];
 
 /** How a service is measured and priced: per square metre, per metre, or per piece. */
@@ -305,6 +306,49 @@ function migrate(db) {
     if (!hasColumn(db, 'order_lines', col)) db.exec(`ALTER TABLE order_lines ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`);
   }
   once('picked_quantity_backfilled', () => db.exec('UPDATE order_lines SET pickedQuantity = quantity WHERE pickedQuantity = 0 AND quantity > 0'));
+  // 2g. saygak (partner) accounts: special prices, own login, no-delivery orders, gilam sizes, lump payments
+  if (!hasColumn(db, 'clients', 'isPartner')) db.exec('ALTER TABLE clients ADD COLUMN isPartner INTEGER NOT NULL DEFAULT 0');
+  if (!hasColumn(db, 'users', 'clientId')) db.exec('ALTER TABLE users ADD COLUMN clientId INTEGER REFERENCES clients(id)');
+  if (!hasColumn(db, 'orders', 'kind')) db.exec("ALTER TABLE orders ADD COLUMN kind TEXT NOT NULL DEFAULT 'regular'");
+  if (!hasColumn(db, 'order_lines', 'expectedQuantity')) db.exec('ALTER TABLE order_lines ADD COLUMN expectedQuantity INTEGER NOT NULL DEFAULT 0');
+  if (!hasColumn(db, 'payments', 'batchId')) db.exec("ALTER TABLE payments ADD COLUMN batchId TEXT NOT NULL DEFAULT ''");
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_users_client ON users(clientId) WHERE clientId IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS order_line_sizes (
+      id     INTEGER PRIMARY KEY AUTOINCREMENT,
+      lineId INTEGER NOT NULL REFERENCES order_lines(id) ON DELETE CASCADE,
+      width  REAL NOT NULL,
+      length REAL NOT NULL,
+      area   REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sizes_line ON order_line_sizes(lineId);
+    CREATE TABLE IF NOT EXISTS client_prices (
+      clientId  INTEGER NOT NULL REFERENCES clients(id),
+      serviceId INTEGER NOT NULL REFERENCES services(id),
+      price     REAL NOT NULL CHECK (price >= 0),
+      PRIMARY KEY (clientId, serviceId)
+    );
+    CREATE TABLE IF NOT EXISTS payment_batches (
+      batchId        TEXT PRIMARY KEY,
+      clientId       INTEGER NOT NULL REFERENCES clients(id),
+      amount         REAL NOT NULL,
+      discount       REAL NOT NULL DEFAULT 0,
+      paidDate       TEXT NOT NULL,
+      createdAt      TEXT NOT NULL,
+      creatorId      INTEGER NOT NULL,
+      creatorName    TEXT NOT NULL,
+      allocations    TEXT NOT NULL,
+      reversedAt     TEXT NOT NULL DEFAULT '',
+      reversedByName TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_batches_client ON payment_batches(clientId);
+    CREATE TRIGGER IF NOT EXISTS users_saygak_pair_ins BEFORE INSERT ON users
+      WHEN (NEW.role = 'saygak') != (NEW.clientId IS NOT NULL)
+      BEGIN SELECT RAISE(ABORT, 'saygak role and clientId must go together'); END;
+    CREATE TRIGGER IF NOT EXISTS users_saygak_pair_upd BEFORE UPDATE OF role, clientId ON users
+      WHEN (NEW.role = 'saygak') != (NEW.clientId IS NOT NULL)
+      BEGIN SELECT RAISE(ABORT, 'saygak role and clientId must go together'); END;
+  `);
   // 3. built-in roles (never overwrite permissions an admin has already edited)
   const ins = db.prepare('INSERT OR IGNORE INTO roles (key, name, permissions, isSystem) VALUES (?,?,?,?)');
   for (const r of DEFAULT_ROLES) ins.run(r.key, r.name, JSON.stringify(r.permissions), r.isSystem);

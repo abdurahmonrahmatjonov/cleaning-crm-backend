@@ -249,7 +249,7 @@ test('roles: permissions, custom roles, packer scope', async () => {
   // only admin manages roles
   assert.equal((await call('GET', '/api/roles', { token: operator })).status, 403);
   const list = await call('GET', '/api/roles', { token: admin });
-  assert.deepEqual(list.body.data.map((r) => r.key).sort(), ['admin', 'driver', 'operator', 'packer']);
+  assert.deepEqual(list.body.data.map((r) => r.key).sort(), ['admin', 'driver', 'operator', 'packer', 'saygak']);
   assert.equal((await call('PATCH', '/api/roles/admin', { token: admin, body: { permissions: [] } })).status, 409);
 
   // create a custom role, assign it, change its permissions live
