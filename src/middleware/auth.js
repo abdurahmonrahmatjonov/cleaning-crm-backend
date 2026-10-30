@@ -47,6 +47,8 @@ export const requirePerm = (...perms) => (req, _res, next) =>
 export const partnerGate = (req, _res, next) =>
   req.user?.clientId != null ? next(new HttpError(403, 'Forbidden for your role')) : next();
 
-/** The partner API is only for accounts tied to a client. */
+/** The partner API is only for accounts tied to a client (a positive integer id; anything else fails closed). */
 export const requirePartner = (req, _res, next) =>
-  req.user?.clientId != null ? next() : next(new HttpError(403, 'Forbidden for your role'));
+  Number.isInteger(req.user?.clientId) && req.user.clientId > 0
+    ? next()
+    : next(new HttpError(403, 'Forbidden for your role'));

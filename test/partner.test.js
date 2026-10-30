@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 process.env.JWT_SECRET = 'test-secret';
 const { openDb, seed } = await import('../src/db.js');
 const { createApp, STAFF_MOUNTS } = await import('../src/app.js');
-const { partnerGate, requirePartner } = await import('../src/middleware/auth.js');
+const { partnerGate, requirePartner, authenticate, requirePerm } = await import('../src/middleware/auth.js');
 const { default: express } = await import('express');
 
 let server, base, db;
@@ -297,41 +297,82 @@ test('access gate: saygak denied on every staff mount; staff denied on /partner'
   assert.equal(STAFF_MOUNTS.length, n);
 });
 
-/** Walks the real Express 5 stack and lists every router/route mount that is not behind partnerGate/requirePartner. */
-function ungatedMounts(app) {
-  const probes = ['/api/auth', '/api/branding', '/api/leak', '/api/partner', '/health'];
-  const label = (layer, i) => probes.find((p) => layer.matchers?.[0]?.(`${p}/x`) || layer.matchers?.[0]?.(p)) ?? `#${i}`;
-  const out = [];
+const PASSIVE_SRC = new Set();
+/**
+ * Walks the real Express 5 stack and lists every path-bound layer that can answer a request without a
+ * partnerGate earlier in its own mount group (the consecutive layers Express 5 creates for one
+ * `app.use(path, a, b, c)`). Global layers are the ones Express dispatches to on every path (`layer.slash`,
+ * see router/lib/layer.js Layer.prototype.match). requirePartner counts as a gate only on /api/partner.
+ * A path-bound layer whose path is not among the probes is reported as `#index` (fail closed).
+ */
+function ungatedMounts(app, extraProbes = []) {
+  if (!PASSIVE_SRC.size) for (const f of [authenticate(db), requirePerm('x')]) PASSIVE_SRC.add(String(f));
   const stack = app.router.stack;
+  const hits = (l, p) => l.slash || l.matchers.some((m) => m(p));
+  const parent = (p) => p.slice(0, p.lastIndexOf('/')) || '/';
+  const at = (l, p) => !l.slash && !l.route && hits(l, p) && hits(l, `${p}/x`) && !hits(l, parent(p));
+  const passive = (h) => h === partnerGate || h === requirePartner || h.name === 'jsonParser' || PASSIVE_SRC.has(String(h));
+  const probes = [...new Set([...STAFF_MOUNTS, '/api/auth', '/api/branding', '/api/partner', ...extraProbes])];
+  const out = [];
   stack.forEach((layer, i) => {
-    if (layer.route) return void out.push(`route:${layer.route.path}`);
-    if (layer.name !== 'router') return;
-    for (let j = i - 1; j >= 0 && stack[j].name !== 'router'; j--) {
-      if (stack[j].handle === partnerGate || stack[j].handle === requirePartner) return;
+    if (layer.slash) return; // global middleware (helmet, cors, json, 404, error handler)
+    if (layer.route) {
+      const handles = layer.route.stack.map((s) => s.handle);
+      if (!handles.slice(0, -1).includes(partnerGate)) out.push(`route:${layer.route.path}`);
+      return;
     }
-    out.push(label(layer, i));
+    if (passive(layer.handle)) return;
+    const p = probes.find((q) => at(layer, q));
+    if (p === undefined) return void out.push(`#${i}`);
+    for (let j = i - 1; j >= 0 && at(stack[j], p); j--) {
+      const h = stack[j].handle;
+      if (h === partnerGate || (h === requirePartner && p === '/api/partner')) return;
+    }
+    out.push(p);
   });
   return out;
 }
 
-test('access gate (structural): every mounted router sits behind the gate except auth and branding', () => {
-  const app = createApp(db, { loginLimit: 1000 });
-  assert.deepEqual(ungatedMounts(app).sort(), ['/api/auth', '/api/branding', 'route:/health']);
-  // negative control: a plain app.use that bypasses mount() must be flagged
-  const leaky = createApp(db, { loginLimit: 1000 });
-  leaky.use('/api/leak', express.Router().get('/', (_req, res) => res.json({ leaked: true })));
-  assert.ok(ungatedMounts(leaky).includes('/api/leak'));
-  const bare = express();
-  bare.use('/api/x', express.Router());
-  assert.deepEqual(ungatedMounts(bare), ['#0']);
+test('access gate (structural): every path-bound layer sits behind the gate except auth, branding and /health', () => {
+  // positive control: the real stack has exactly the allowlist
+  assert.deepEqual(ungatedMounts(createApp(db, { loginLimit: 1000 })).sort(), ['/api/auth', '/api/branding', 'route:/health']);
+  const leak = (add) => {
+    const app = createApp(db, { loginLimit: 1000 });
+    add(app);
+    return ungatedMounts(app, ['/api/x', '/api/sub', '/api/a', '/api/b', '/api/s', '/api/leak']);
+  };
+  const extra = (out) => out.filter((m) => !['/api/auth', '/api/branding', 'route:/health'].includes(m));
+  // negative controls, each through the same walker
+  assert.deepEqual(extra(leak((a) => a.use('/api/leak', express.Router().get('/', (_q, r) => r.json({}))))), ['/api/leak']);
+  assert.deepEqual(extra(leak((a) => a.use('/api/x', (_q, r) => r.json({ leaked: true })))), ['/api/x']);
+  assert.deepEqual(extra(leak((a) => a.use('/api/sub', express()))), ['/api/sub']);
+  assert.deepEqual(extra(leak((a) => { a.use('/api/a', partnerGate); a.use('/api/b', express.Router()); })), ['/api/b']);
+  assert.deepEqual(extra(leak((a) => a.use('/api/s', requirePartner, express.Router()))), ['/api/s']);
+  // a gated mount on a new path passes; an unknown path is flagged (fail closed)
+  assert.deepEqual(extra(leak((a) => a.use('/api/x', partnerGate, express.Router()))), []);
+  assert.deepEqual(extra(leak((a) => a.use('/api/unprobed', partnerGate, express.Router()))).length, 1);
 });
 
-test('partnerGate / requirePartner fail closed on clientId 0', () => {
+test('partnerGate / requirePartner fail closed on odd clientIds', () => {
   const run = (mw, user) => { let arg = 'unset'; mw({ user }, {}, (e) => { arg = e; }); return arg; };
-  assert.equal(run(partnerGate, { clientId: 0 })?.status, 403);
-  assert.equal(run(requirePartner, { clientId: null })?.status, 403);
-  assert.equal(run(requirePartner, { clientId: 0 }), undefined);
-  assert.equal(run(partnerGate, { clientId: null }), undefined);
+  const denied = (mw, user) => {
+    const e = run(mw, user);
+    return e?.status === 403 && e.message === 'Forbidden for your role';
+  };
+  // clientId 0 is locked out of both staff and partner routes
+  assert.ok(denied(partnerGate, { clientId: 0 }));
+  assert.ok(denied(requirePartner, { clientId: 0 }));
+  // requirePartner admits only a positive integer
+  assert.ok(denied(requirePartner, { clientId: '5' }));
+  assert.ok(denied(requirePartner, { clientId: -1 }));
+  assert.ok(denied(requirePartner, { clientId: 1.5 }));
+  assert.equal(run(requirePartner, { clientId: 5 }), undefined);
+  assert.ok(denied(partnerGate, { clientId: 5 }));
+  assert.ok(denied(partnerGate, { clientId: '5' }));
+  for (const clientId of [null, undefined]) {
+    assert.equal(run(partnerGate, { clientId }), undefined);
+    assert.ok(denied(requirePartner, { clientId }));
+  }
 });
 
 test('access gate: deactivated saygak gets 401, not 403', async () => {
