@@ -424,3 +424,74 @@ test('access gate: deactivated saygak gets 401, not 403', async () => {
   assert.equal((await call('GET', '/api/partner/ping', { token })).status, 401);
   assert.equal((await call('GET', '/api/services', { token })).status, 401);
 });
+
+// ---------- Task 5: partner-kind orders ----------
+
+const partnerOrder = (clientId, over = {}) => call('POST', '/api/orders', { token: operator, body: { clientId, lines: [{ serviceId: 1, price: 1 }], ...over } });
+
+test('partner order: staff create locks prices, no location needed, unpriced service rejected', async () => {
+  const r = await partnerOrder(clientA);
+  assert.equal(r.status, 201);
+  assert.equal(r.body.kind, 'partner');
+  assert.equal(r.body.lines[0].price, 6000);
+  assert.equal(r.body.lines[0].customerPrice, 6000);
+  assert.equal(r.body.lines[0].expectedQuantity, 0);
+  assert.deepEqual(r.body.location, { latitude: 0, longitude: 0 });
+  const bad = await partnerOrder(clientA, { lines: [{ serviceId: 2, price: 1 }] });
+  assert.equal(bad.status, 400);
+  assert.match(JSON.stringify(bad.body), /lines\.0\.serviceId/);
+  const exp = await partnerOrder(clientA, { lines: [{ serviceId: 1, expectedQuantity: 7 }] });
+  assert.equal(exp.body.lines[0].expectedQuantity, 7);
+  assert.equal((await partnerOrder(clientA, { lines: [{ serviceId: 1, expectedQuantity: 0 }] })).status, 400);
+});
+
+test('regular orders: unchanged shape works; missing location/pickupTime/price is 400; kind regular', async () => {
+  const ok = await call('POST', '/api/orders', { token: operator, body: newOrder() });
+  assert.equal(ok.status, 201);
+  assert.equal(ok.body.kind, 'regular');
+  const { location, ...noLoc } = newOrder();
+  assert.equal((await call('POST', '/api/orders', { token: operator, body: noLoc })).status, 400);
+  const { pickupTime, ...noTime } = newOrder();
+  assert.equal((await call('POST', '/api/orders', { token: operator, body: noTime })).status, 400);
+  assert.equal((await call('POST', '/api/orders', { token: operator, body: newOrder({ lines: [{ serviceId: 1 }] }) })).status, 400);
+  // regular pickup still needs waybill and delivery time
+  const o = ok.body;
+  const lines = o.lines.map((l) => ({ id: l.id, quantity: 2 }));
+  assert.equal((await call('PATCH', `/api/orders/${o.docNum}/pickup`, { token: driver, body: { deliveryTime: '2026-11-02T10:00', lines } })).status, 400);
+  assert.equal((await call('PATCH', `/api/orders/${o.docNum}/pickup`, { token: driver, body: { waybillNumber: 'N9', lines } })).status, 400);
+});
+
+test('partner order: pickup without waybill, sizes, handover with no money, no payments, no location edit', async () => {
+  const o = (await partnerOrder(clientA)).body;
+  const ed = await call('PATCH', `/api/orders/${o.docNum}`, { token: operator, body: { location: { latitude: 41, longitude: 69 } } });
+  assert.equal(ed.status, 409);
+  const pk = await call('PATCH', `/api/orders/${o.docNum}/pickup`, { token: driver, body: { lines: [{ id: o.lines[0].id, quantity: 2 }] } });
+  assert.equal(pk.status, 200);
+  assert.equal(pk.body.waybillNumber, '');
+  assert.equal(pk.body.deliveryTime, '');
+  const id = o.lines[0].id;
+  assert.equal((await wash(pk.body, [{ id, quantity: 2, sizes: [{ width: 5, length: 4 }] }])).status, 200);
+  assert.equal((await call('PATCH', `/api/orders/${o.docNum}/pack`, { token: packer, body: { lines: [{ id, quantity: 2 }] } })).status, 200);
+  const dl = (body) => call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body });
+  assert.equal((await dl({ paid: 1000, lines: [{ id, sqm: 20 }] })).status, 400);
+  assert.equal((await dl({ discount: 500, lines: [{ id, sqm: 20 }] })).status, 400);
+  const done = await dl({ lines: [{ id, sqm: 20 }] });
+  assert.equal(done.status, 200);
+  assert.equal(done.body.status, 'Yetkazib berildi');
+  assert.equal(done.body.docTotal, 120000);
+  assert.equal(done.body.paid, 0);
+  assert.equal(done.body.debt, 120000);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM payments WHERE docNum = ?').get(o.docNum).c, 0);
+  const pay = await call('POST', `/api/orders/${o.docNum}/payments`, { token: admin, body: { amount: 1000 } });
+  assert.equal(pay.status, 409);
+  assert.match(pay.body.error?.message ?? JSON.stringify(pay.body), /Saygak orders are paid from the client page/);
+});
+
+test('partner order: 11th open order is 409', async () => {
+  const { client } = await makePartner('Saygak Cap', '+998902222251', 'capP');
+  for (let i = 0; i < 10; i++) assert.equal((await partnerOrder(client.id)).status, 201);
+  const r = await partnerOrder(client.id);
+  assert.equal(r.status, 409);
+  const { createPartnerOrder } = await import('../src/routes/orders.js');
+  assert.equal(typeof createPartnerOrder, 'function');
+});
