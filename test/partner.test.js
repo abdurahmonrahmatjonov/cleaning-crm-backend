@@ -297,60 +297,102 @@ test('access gate: saygak denied on every staff mount; staff denied on /partner'
   assert.equal(STAFF_MOUNTS.length, n);
 });
 
+const { notFoundHandler, errorHandler } = await import('../src/middleware/error.js');
 const PASSIVE_SRC = new Set();
+let AUTH_SRC;
+// The only layers allowed to run on every path: matched by exact handle name (helmet/cors/json are factory
+// closures) or by identity. Anything else path-less or on '/' is reported as `global:<name>`.
+const KNOWN_GLOBAL = (h) =>
+  ['helmetMiddleware', 'corsMiddleware', 'jsonParser'].includes(h.name) || h === notFoundHandler || h === errorHandler;
 /**
- * Walks the real Express 5 stack and lists every path-bound layer that can answer a request without a
- * partnerGate earlier in its own mount group (the consecutive layers Express 5 creates for one
- * `app.use(path, a, b, c)`). Global layers are the ones Express dispatches to on every path (`layer.slash`,
- * see router/lib/layer.js Layer.prototype.match). requirePartner counts as a gate only on /api/partner.
- * A path-bound layer whose path is not among the probes is reported as `#index` (fail closed).
+ * Walks the real Express 5 stack and proves that every layer able to answer a request is preceded, within its
+ * own mount group (the consecutive layers Express 5 creates for one `app.use(path, a, b, c)`) or, for a route,
+ * within the handlers of each HTTP method, by `authenticate` and then partnerGate (requirePartner only on
+ * /api/partner). A gate without authenticate in front fails open (req.user undefined), so it does not count.
+ * Global layers (`layer.slash`, the predicate Express dispatches on, see router/lib/layer.js) must be in
+ * KNOWN_GLOBAL; their names are pushed to `skipped` so the caller can pin the exact list. A path-bound layer
+ * whose path is not among the probes is reported as `#index` (fail closed).
  */
-function ungatedMounts(app, extraProbes = []) {
-  if (!PASSIVE_SRC.size) for (const f of [authenticate(db), requirePerm('x')]) PASSIVE_SRC.add(String(f));
+function ungatedMounts(app, extraProbes = [], skipped = []) {
+  if (!AUTH_SRC) {
+    AUTH_SRC = String(authenticate(db));
+    for (const f of [authenticate(db), requirePerm('x')]) PASSIVE_SRC.add(String(f));
+  }
   const stack = app.router.stack;
   const hits = (l, p) => l.slash || l.matchers.some((m) => m(p));
   const parent = (p) => p.slice(0, p.lastIndexOf('/')) || '/';
   const at = (l, p) => !l.slash && !l.route && hits(l, p) && hits(l, `${p}/x`) && !hits(l, parent(p));
+  const isGate = (h, p) => h === partnerGate || (h === requirePartner && p === '/api/partner');
   const passive = (h) => h === partnerGate || h === requirePartner || h.name === 'jsonParser' || PASSIVE_SRC.has(String(h));
+  // true when the handlers in `before` contain authenticate followed (later) by a gate
+  const authThenGate = (before, p) => {
+    const a = before.findIndex((h) => String(h) === AUTH_SRC);
+    return a >= 0 && before.slice(a + 1).some((h) => isGate(h, p));
+  };
   const probes = [...new Set([...STAFF_MOUNTS, '/api/auth', '/api/branding', '/api/partner', ...extraProbes])];
   const out = [];
   stack.forEach((layer, i) => {
-    if (layer.slash) return; // global middleware (helmet, cors, json, 404, error handler)
     if (layer.route) {
-      const handles = layer.route.stack.map((s) => s.handle);
-      if (!handles.slice(0, -1).includes(partnerGate)) out.push(`route:${layer.route.path}`);
+      const { path, stack: rs } = layer.route;
+      const methods = new Set(rs.map((s) => s.method));
+      // each method sees the `.all()` entries (method undefined) plus its own, in order
+      const ok = [...methods].every((m) => {
+        const hs = rs.filter((s) => s.method === m || s.method === undefined).map((s) => s.handle);
+        const f = hs.findIndex((h) => !passive(h));
+        return f < 0 || authThenGate(hs.slice(0, f), path);
+      });
+      if (!ok) out.push(`route:${path}`);
+      return;
+    }
+    if (layer.slash) {
+      if (KNOWN_GLOBAL(layer.handle)) skipped.push(layer.handle.name);
+      else out.push(`global:${layer.handle.name || `#${i}`}`);
       return;
     }
     if (passive(layer.handle)) return;
     const p = probes.find((q) => at(layer, q));
     if (p === undefined) return void out.push(`#${i}`);
-    for (let j = i - 1; j >= 0 && at(stack[j], p); j--) {
-      const h = stack[j].handle;
-      if (h === partnerGate || (h === requirePartner && p === '/api/partner')) return;
-    }
-    out.push(p);
+    let j = i;
+    while (j > 0 && at(stack[j - 1], p)) j--;
+    if (!authThenGate(stack.slice(j, i).map((l) => l.handle), p)) out.push(p);
   });
   return out;
 }
 
 test('access gate (structural): every path-bound layer sits behind the gate except auth, branding and /health', () => {
-  // positive control: the real stack has exactly the allowlist
-  assert.deepEqual(ungatedMounts(createApp(db, { loginLimit: 1000 })).sort(), ['/api/auth', '/api/branding', 'route:/health']);
+  // positive control: the real stack has exactly the allowlist, and exactly the known global layers
+  const skipped = [];
+  assert.deepEqual(ungatedMounts(createApp(db, { loginLimit: 1000 }), [], skipped).sort(), ['/api/auth', '/api/branding', 'route:/health']);
+  assert.deepEqual(skipped, ['helmetMiddleware', 'corsMiddleware', 'jsonParser', 'notFoundHandler', 'errorHandler']);
   const leak = (add) => {
     const app = createApp(db, { loginLimit: 1000 });
     add(app);
     return ungatedMounts(app, ['/api/x', '/api/sub', '/api/a', '/api/b', '/api/s', '/api/leak']);
   };
   const extra = (out) => out.filter((m) => !['/api/auth', '/api/branding', 'route:/health'].includes(m));
+  const ok = (_q, r) => r.json({ leaked: true });
   // negative controls, each through the same walker
-  assert.deepEqual(extra(leak((a) => a.use('/api/leak', express.Router().get('/', (_q, r) => r.json({}))))), ['/api/leak']);
-  assert.deepEqual(extra(leak((a) => a.use('/api/x', (_q, r) => r.json({ leaked: true })))), ['/api/x']);
+  assert.deepEqual(extra(leak((a) => a.use('/api/leak', express.Router().get('/', ok)))), ['/api/leak']);
+  assert.deepEqual(extra(leak((a) => a.use('/api/x', ok))), ['/api/x']);
   assert.deepEqual(extra(leak((a) => a.use('/api/sub', express()))), ['/api/sub']);
-  assert.deepEqual(extra(leak((a) => { a.use('/api/a', partnerGate); a.use('/api/b', express.Router()); })), ['/api/b']);
-  assert.deepEqual(extra(leak((a) => a.use('/api/s', requirePartner, express.Router()))), ['/api/s']);
+  assert.deepEqual(extra(leak((a) => { a.use('/api/a', authenticate(db), partnerGate); a.use('/api/b', express.Router()); })), ['/api/b']);
+  assert.deepEqual(extra(leak((a) => a.use('/api/s', authenticate(db), requirePartner, express.Router()))), ['/api/s']);
+  // path-less or '/' mounts are not a hiding place
+  assert.deepEqual(extra(leak((a) => a.use(express.Router().get('/api/leak', ok)))), ['global:router']);
+  assert.deepEqual(extra(leak((a) => a.use(express()))), ['global:mounted_app']);
+  assert.deepEqual(extra(leak((a) => a.use('/', express.Router()))), ['global:router']);
+  assert.deepEqual(extra(leak((a) => a.use(ok))).length, 1);
+  assert.match(extra(leak((a) => a.use(ok)))[0] ?? '', /^global:/);
+  // every method of a route needs the gate
+  assert.deepEqual(extra(leak((a) => a.route('/api/r').get(authenticate(db), partnerGate, ok).post(ok))), ['route:/api/r']);
+  assert.deepEqual(extra(leak((a) => a.route('/api/r').all(authenticate(db), partnerGate).get(ok).post(ok))), []);
+  // a gate without authenticate in front fails open (req.user is undefined), so it does not count
+  assert.deepEqual(extra(leak((a) => a.use('/api/x', partnerGate, express.Router()))), ['/api/x']);
+  assert.deepEqual(extra(leak((a) => a.use('/api/x', partnerGate, authenticate(db), express.Router()))), ['/api/x']);
+  assert.deepEqual(extra(leak((a) => a.route('/api/r').get(partnerGate, ok))), ['route:/api/r']);
   // a gated mount on a new path passes; an unknown path is flagged (fail closed)
-  assert.deepEqual(extra(leak((a) => a.use('/api/x', partnerGate, express.Router()))), []);
-  assert.deepEqual(extra(leak((a) => a.use('/api/unprobed', partnerGate, express.Router()))).length, 1);
+  assert.deepEqual(extra(leak((a) => a.use('/api/x', authenticate(db), partnerGate, express.Router()))), []);
+  assert.deepEqual(extra(leak((a) => a.use('/api/unprobed', authenticate(db), partnerGate, express.Router()))).length, 1);
 });
 
 test('partnerGate / requirePartner fail closed on odd clientIds', () => {
