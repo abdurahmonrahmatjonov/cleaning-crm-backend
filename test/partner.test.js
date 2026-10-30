@@ -284,11 +284,9 @@ test('access gate: saygak denied on every staff mount; staff denied on /partner'
   for (const p of ['/api/services', '/api/chat/global', '/api/orders/received', '/api/comments', '/api/clients', '/api/reports/summary', '/api/activity', '/api/users', '/api/roles', '/api/expenses', '/api/expense-types']) {
     assert.equal((await call('GET', p, { token: partnerA })).status, 403, p);
   }
-  const ping = await call('GET', '/api/partner/ping', { token: partnerA });
-  assert.equal(ping.status, 200);
-  assert.deepEqual(ping.body, { ok: true });
-  for (const t of [admin, operator, driver, packer]) assert.equal((await call('GET', '/api/partner/ping', { token: t })).status, 403);
-  assert.equal((await call('GET', '/api/partner/ping')).status, 401);
+  assert.equal((await call('GET', '/api/partner/me', { token: partnerA })).status, 200);
+  for (const t of [admin, operator, driver, packer]) assert.equal((await call('GET', '/api/partner/me', { token: t })).status, 403);
+  assert.equal((await call('GET', '/api/partner/me')).status, 401);
   assert.equal((await call('GET', '/api/auth/me', { token: partnerA })).status, 200);
   assert.equal((await call('GET', '/api/branding', { token: partnerA })).status, 200);
   // creating another app must not duplicate mounts
@@ -419,9 +417,9 @@ test('partnerGate / requirePartner fail closed on odd clientIds', () => {
 
 test('access gate: deactivated saygak gets 401, not 403', async () => {
   const { client, token } = await makePartner('Saygak Gate', '+998902222241', 'gateP');
-  assert.equal((await call('GET', '/api/partner/ping', { token })).status, 200);
+  assert.equal((await call('GET', '/api/partner/me', { token })).status, 200);
   assert.equal((await call('PATCH', `/api/clients/${client.id}/login`, { token: admin, body: { isActive: false } })).status, 200);
-  assert.equal((await call('GET', '/api/partner/ping', { token })).status, 401);
+  assert.equal((await call('GET', '/api/partner/me', { token })).status, 401);
   assert.equal((await call('GET', '/api/services', { token })).status, 401);
 });
 
@@ -724,4 +722,190 @@ test('un-flagging a saygak is blocked while partner debt remains', async () => {
   assert.equal((await pay(client.id, { amount: 50000 })).status, 201);
   assert.equal((await unflag()).status, 200);
   assert.equal(db.prepare('SELECT isPartner FROM clients WHERE id = ?').get(client.id).isPartner, 0);
+});
+
+// ---------- Task 7: saygak-facing API ----------
+const P = (method, path, token, body) => call(method, `/api/partner${path}`, { token, body });
+const FORBIDDEN = ['createdBy', 'pickedUpBy', 'washedBy', 'packedBy', 'deliveredBy', 'waybillNumber', 'latitude', 'longitude', 'landmark', 'pickupTime', 'cancelReason'];
+const AMOUNT_KEYS = ['price', 'sqm', 'lineTotal'];
+const ORDER_AMOUNT_KEYS = ['docTotal', 'paid', 'discount', 'debt'];
+
+// walk a partner order through the staff API up to and including delivery
+const staffWalk = async (docNum, upTo = 'deliver') => {
+  const o = (await call('GET', `/api/orders/${docNum}`, { token: admin })).body;
+  const id = o.lines[0].id;
+  const step = async (name, who, body) => assert.equal((await call('PATCH', `/api/orders/${docNum}/${name}`, { token: who, body })).status, 200, name);
+  await step('pickup', driver, { lines: [{ id, quantity: 2 }] });
+  if (upTo === 'pickup') return id;
+  await step('wash', packer, { lines: [{ id, quantity: 2, sizes: [{ width: 5, length: 4 }] }] });
+  if (upTo === 'wash') return id;
+  await step('pack', packer, { lines: [{ id, quantity: 2 }] });
+  if (upTo === 'pack') return id;
+  await step('deliver', admin, { lines: [{ id, sqm: 20 }] });
+  return id;
+};
+
+test('partner api: staff token is refused, identity comes only from the token', async () => {
+  assert.equal((await P('GET', '/me', admin)).status, 403);
+  assert.equal((await P('GET', '/me', undefined)).status, 401);
+  const me = await P('GET', `/me?clientId=${clientB}`, partnerA);
+  assert.equal(me.status, 200);
+  assert.equal(me.body.client.id, clientA);
+});
+
+test('partner api: /services lists only own priced active services without defaultPrice', async () => {
+  db.prepare('UPDATE services SET defaultPrice = 99999 WHERE id = 1').run();
+  const a = await P('GET', '/services', partnerA);
+  assert.equal(a.status, 200);
+  assert.deepEqual(a.body.map((s) => s.id), [1]);
+  assert.equal(a.body[0].price, 6000);
+  assert.deepEqual(Object.keys(a.body[0]).sort(), ['id', 'name', 'price', 'unit']);
+  assert.equal((await P('GET', '/services', partnerB)).body[0].price, 7000);
+  // deactivated service disappears
+  const { client, token } = await makePartner('Svc Inactive', '+998904000001', 'svcInact', [{ serviceId: 1, price: 5000 }, { serviceId: 2, price: 4000 }]);
+  db.prepare('UPDATE services SET isActive = 0 WHERE id = 2').run();
+  assert.deepEqual((await P('GET', '/services', token)).body.map((s) => s.id), [1]);
+  db.prepare('UPDATE services SET isActive = 1 WHERE id = 2').run();
+  assert.ok(client.id);
+});
+
+test('partner api: POST /orders uses own price, ignores client-sent identity and price, validates', async () => {
+  const r = await P('POST', '/orders', partnerA, { clientId: clientB, clientName: 'Hacker', clientPhone: '+998900000000', lines: [{ serviceId: 1, price: 1, expectedQuantity: 3, customerPrice: 1 }] });
+  assert.equal(r.status, 201);
+  const row = db.prepare('SELECT * FROM orders WHERE docNum = ?').get(r.body.docNum);
+  assert.equal(row.clientId, clientA);
+  assert.equal(row.kind, 'partner');
+  assert.notEqual(row.clientName, 'Hacker');
+  const line = db.prepare('SELECT * FROM order_lines WHERE docNum = ?').get(r.body.docNum);
+  assert.equal(line.price, 6000);
+  assert.equal(line.customerPrice, 6000);
+  assert.equal(r.body.lines[0].expectedQuantity, 3);
+  assert.equal(r.body.status, 'Zakaz Qabul qilindi');
+  assert.equal(JSON.parse(db.prepare("SELECT details FROM activity_log WHERE entityId = ? AND action = 'order.created'").get(String(r.body.docNum)).details).via, 'partner');
+  // unpriced service
+  assert.equal((await P('POST', '/orders', partnerA, { lines: [{ serviceId: 2 }] })).status, 400);
+  // duplicate service
+  assert.equal((await P('POST', '/orders', partnerA, { lines: [{ serviceId: 1 }, { serviceId: 1 }] })).status, 400);
+  assert.equal((await P('POST', '/orders', partnerA, { lines: [] })).status, 400);
+  assert.equal((await P('POST', '/orders', partnerA, { lines: [{ serviceId: 1, expectedQuantity: 0 }] })).status, 400);
+});
+
+test('partner api: 11th open order is 409', async () => {
+  const { token } = await makePartner('Api Cap', '+998904000002', 'apiCap');
+  for (let i = 0; i < 10; i++) assert.equal((await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).status, 201);
+  assert.equal((await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).status, 409);
+  assert.equal((await P('GET', '/me', token)).body.openOrders, 10);
+});
+
+test('partner api: cross-client and non-partner orders are 404 on every :docNum route', async () => {
+  const b = (await P('POST', '/orders', partnerB, { lines: [{ serviceId: 1 }] })).body;
+  const lineB = b.lines[0].id;
+  assert.equal((await P('GET', `/orders/${b.docNum}`, partnerA)).status, 404);
+  assert.equal((await P('PATCH', `/orders/${b.docNum}`, partnerA, { lines: [{ id: lineB, expectedQuantity: 5 }] })).status, 404);
+  assert.equal((await P('POST', `/orders/${b.docNum}/cancel`, partnerA, { reason: 'x' })).status, 404);
+  assert.equal(db.prepare('SELECT status FROM orders WHERE docNum = ?').get(b.docNum).status, 'Zakaz Qabul qilindi');
+  assert.equal((await P('GET', `/orders/${b.docNum}`, partnerB)).status, 200);
+  // a staff-created regular order for the same phone as A
+  const reg = db.prepare(
+    `INSERT INTO orders (kind, status, clientId, clientName, clientPhone, latitude, longitude, pickupPlannedAt, createdById, createdByName, createdAt, orderTakenAt)
+     VALUES ('regular', 'Zakaz Qabul qilindi', ?, 'n', 'p', 1, 1, 'x', 1, 'admin', 'x', 'x')`).run(clientA).lastInsertRowid;
+  assert.equal((await P('GET', `/orders/${reg}`, partnerA)).status, 404);
+  assert.equal((await P('POST', `/orders/${reg}/cancel`, partnerA, { reason: 'x' })).status, 404);
+  assert.equal((await P('GET', '/orders/999999', partnerA)).status, 404);
+  const list = (await P('GET', '/orders?limit=200', partnerA)).body;
+  assert.ok(!list.data.some((o) => o.docNum === reg || o.docNum === b.docNum));
+});
+
+test('partner api: edit and cancel only in RECEIVED, line ids must belong to the order, both logged', async () => {
+  const o = (await P('POST', '/orders', partnerA, { lines: [{ serviceId: 1, expectedQuantity: 2 }] })).body;
+  const other = (await P('POST', '/orders', partnerA, { lines: [{ serviceId: 1 }] })).body;
+  const lineId = o.lines[0].id;
+  assert.equal((await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: other.lines[0].id, expectedQuantity: 9 }] })).status, 400);
+  assert.equal((await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: lineId, expectedQuantity: 0 }] })).status, 400);
+  const ed = await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: lineId, expectedQuantity: 9, price: 1 }] });
+  assert.equal(ed.status, 200);
+  assert.equal(ed.body.lines[0].expectedQuantity, 9);
+  assert.equal(db.prepare('SELECT price FROM order_lines WHERE id = ?').get(lineId).price, 6000);
+  const log = (action) => db.prepare('SELECT * FROM activity_log WHERE entity = ? AND entityId = ? AND action = ?').get('order', String(o.docNum), action);
+  assert.equal(log('order.edited').userName, db.prepare('SELECT fullName FROM users WHERE clientId = ?').get(clientA).fullName);
+  assert.equal(JSON.parse(log('order.edited').details).via, 'partner');
+  // cancel
+  assert.equal((await P('POST', `/orders/${o.docNum}/cancel`, partnerA, {})).status, 400);
+  const c = await P('POST', `/orders/${o.docNum}/cancel`, partnerA, { reason: 'Kerak emas' });
+  assert.equal(c.status, 200);
+  assert.equal(c.body.status, ORDER_STATUS.CANCELLED);
+  assert.equal(db.prepare('SELECT status FROM orders WHERE docNum = ?').get(o.docNum).status, ORDER_STATUS.CANCELLED);
+  assert.equal(JSON.parse(log('order.cancelled').details).via, 'partner');
+  assert.equal((await P('POST', `/orders/${o.docNum}/cancel`, partnerA, { reason: 'again' })).status, 409);
+  assert.equal((await P('PATCH', `/orders/${o.docNum}`, partnerA, { lines: [{ id: lineId, expectedQuantity: 1 }] })).status, 409);
+  // after pickup
+  const p = (await P('POST', '/orders', partnerA, { lines: [{ serviceId: 1 }] })).body;
+  await staffWalk(p.docNum, 'pickup');
+  assert.equal((await P('POST', `/orders/${p.docNum}/cancel`, partnerA, { reason: 'late' })).status, 409);
+  assert.equal((await P('PATCH', `/orders/${p.docNum}`, partnerA, { lines: [{ id: p.lines[0].id, expectedQuantity: 1 }] })).status, 409);
+});
+const { ORDER_STATUS } = await import('../src/db.js');
+
+test('partner api: amounts hidden before handover, visible after; sizes and counts follow the stage', async () => {
+  const { client, token } = await makePartner('Api Amounts', '+998904000003', 'apiAmt');
+  const o = (await P('POST', '/orders', token, { lines: [{ serviceId: 1, expectedQuantity: 3 }] })).body;
+  const check = (body, { amounts, quantity, sizes }) => {
+    const l = body.lines[0];
+    for (const k of AMOUNT_KEYS) assert.equal(k in l ? l[k] !== null : false, amounts, `line.${k}`);
+    for (const k of ORDER_AMOUNT_KEYS) assert.equal(k in body ? body[k] !== null : false, amounts, k);
+    assert.equal(l.quantity, quantity);
+    assert.equal(l.sizes.length, sizes ? 1 : 0);
+    assert.equal(l.sizesTotal, sizes ? 20 : 0);
+  };
+  check((await P('GET', `/orders/${o.docNum}`, token)).body, { amounts: false, quantity: null, sizes: false });
+  await staffWalk(o.docNum, 'pickup');
+  check((await P('GET', `/orders/${o.docNum}`, token)).body, { amounts: false, quantity: null, sizes: false });
+  const id = o.lines[0].id;
+  await call('PATCH', `/api/orders/${o.docNum}/wash`, { token: packer, body: { lines: [{ id, quantity: 2, sizes: [{ width: 5, length: 4 }] }] } });
+  check((await P('GET', `/orders/${o.docNum}`, token)).body, { amounts: false, quantity: null, sizes: true });
+  await call('PATCH', `/api/orders/${o.docNum}/pack`, { token: packer, body: { lines: [{ id, quantity: 2 }] } });
+  check((await P('GET', `/orders/${o.docNum}`, token)).body, { amounts: false, quantity: 2, sizes: true });
+  await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body: { lines: [{ id, sqm: 20 }] } });
+  const d = (await P('GET', `/orders/${o.docNum}`, token)).body;
+  check(d, { amounts: true, quantity: 2, sizes: true });
+  assert.equal(d.docTotal, 120000);
+  assert.equal(d.debt, 120000);
+  assert.equal(d.lines[0].price, 6000);
+  assert.equal(d.lines[0].lineTotal, 120000);
+  assert.ok(d.deliveredDate);
+  // list + detail never leak staff-only fields
+  const list = await P('GET', '/orders', token);
+  assert.equal(list.status, 200);
+  assert.deepEqual(list.body.meta, { page: 1, limit: 20, total: 1 });
+  for (const body of [list.body, d]) {
+    const s = JSON.stringify(body);
+    for (const f of FORBIDDEN) assert.ok(!s.includes(f), `leaked ${f}`);
+  }
+  // cancelled order does not leak the reason either
+  const c = (await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).body;
+  await P('POST', `/orders/${c.docNum}/cancel`, token, { reason: 'secret-reason-text' });
+  const cs = JSON.stringify((await P('GET', `/orders/${c.docNum}`, token)).body);
+  assert.ok(!cs.includes('cancelReason') && !cs.includes('secret-reason-text'));
+  assert.ok(cs.includes('cancelledAt'));
+  // /me debt equals staff side
+  const staff = (await call('GET', `/api/clients/${client.id}`, { token: admin })).body;
+  assert.equal((await P('GET', '/me', token)).body.debt, staff.debt);
+  assert.equal((await P('GET', '/me', token)).body.debt, 120000);
+  // status filter
+  assert.equal((await P('GET', `/orders?status=${encodeURIComponent('Yetkazib berildi')}`, token)).body.meta.total, 1);
+  assert.equal((await P('GET', '/orders?status=Bogus', token)).status, 400);
+});
+
+test('partner api: /statement matches the staff statement and validates month', async () => {
+  const { client, token } = await makePartner('Api Stmt', '+998904000004', 'apiStmt');
+  seedDelivered(client.id, 80000, D(1));
+  assert.equal((await pay(client.id, { amount: 30000 })).status, 201);
+  const mine = await P('GET', '/statement', token);
+  assert.equal(mine.status, 200);
+  assert.deepEqual(mine.body, (await stmt(client.id)).body);
+  const m = await P('GET', `/statement?month=${prevMonth}`, token);
+  assert.deepEqual(m.body, (await stmt(client.id, prevMonth)).body);
+  assert.equal((await P('GET', '/statement?month=2026-13', token)).status, 400);
+  // another client's statement is unreachable by param
+  assert.deepEqual((await P('GET', `/statement?clientId=${clientB}`, token)).body, mine.body);
 });
