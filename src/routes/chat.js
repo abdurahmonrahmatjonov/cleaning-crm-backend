@@ -78,7 +78,7 @@ export function chatRouter(db) {
   // People you can write to, with unread counts and the latest private message for each.
   router.get('/users', (req, res) => {
     const me = req.user.id;
-    const users = db.prepare('SELECT id, fullName, role FROM users WHERE isActive = 1 AND id != ? ORDER BY fullName').all(me);
+    const users = db.prepare('SELECT id, fullName, role FROM users WHERE isActive = 1 AND clientId IS NULL AND id != ? ORDER BY fullName').all(me);
     const roleName = db.prepare('SELECT name FROM roles WHERE key = ?');
     const last = db.prepare(
       `SELECT id, senderId, body, createdAt, fileName, fileMime FROM messages

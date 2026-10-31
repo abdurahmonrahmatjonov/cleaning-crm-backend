@@ -384,7 +384,7 @@ Un-flagging (`isPartner: false`) is refused with `409` while the saygak has an a
 | PUT | `/clients/:id/prices` | Admin. `{ prices: [{ serviceId, price }] }` (price 0 to 1e9, no duplicate service, at most 500). **Replaces** the whole list: services not sent lose their price. Inactive/unknown service gives `400`. `409` if the client is not a saygak. Returns the same shape as GET |
 | GET | `/clients/:id/login` | Admin. `{ username, isActive }` or `null` when the client has no login |
 | PUT | `/clients/:id/login` | Admin. `{ username, fullName?, password }` creates the login, or resets username and password of the existing one. `username` is 3 to 50 characters: letters, digits and `_ . -`. `password` is 8 to 100 characters. `409` for a duplicate username or a client that is not a saygak. Returns `{ username, isActive }` |
-| PATCH | `/clients/:id/login` | Admin. `{ isActive }`. `404` if there is no login. A deactivated saygak's token stops working at once (`401`). Returns `{ username, isActive }` |
+| PATCH | `/clients/:id/login` | Admin. `{ isActive }`. `404` if there is no login. `{ isActive: true }` gives `409` when the client is no longer a saygak (deactivating is always allowed). A deactivated saygak's token stops working at once (`401`). Returns `{ username, isActive }` |
 
 The bodies of `PUT /clients/:id/login`, `PUT /clients/:id/prices`, `PATCH /clients/:id/login` and `POST /clients/:id/payments` are strict: an unknown key gives `400`.
 

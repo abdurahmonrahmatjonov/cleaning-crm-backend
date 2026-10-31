@@ -40,7 +40,7 @@ export function buildStatement(db, clientId, month) {
   const orders = db
     .prepare(
       `SELECT o.docNum, o.deliveredDate, o.docTotal,
-              COALESCE((SELECT SUM(l.sqm) FROM order_lines l JOIN services s ON s.id = l.serviceId WHERE l.docNum = o.docNum AND s.unit = 'kv.m'), 0) sqmTotal
+              COALESCE((SELECT SUM(l.sqm) FROM order_lines l WHERE l.docNum = o.docNum AND l.unit = 'kv.m'), 0) sqmTotal
        FROM orders o WHERE o.clientId = ? AND o.kind = 'partner' AND o.status = ? AND o.deliveredDate BETWEEN ? AND ?
        ORDER BY o.deliveredDate, o.docNum`,
     )

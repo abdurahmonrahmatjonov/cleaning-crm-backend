@@ -1100,3 +1100,18 @@ test('login can only be reactivated for a current saygak', async () => {
   assert.equal((await login(false)).status, 200); // deactivation stays allowed
 });
 
+test('staff chat user list does not include saygak logins', async () => {
+  await makePartner('Chat Hidden', '+998906000005', 'chatHid');
+  const list = (await call('GET', '/api/chat/users', { token: operator })).body.data;
+  assert.ok(list.length > 0);
+  assert.equal(list.some((u) => u.fullName === 'Chat Hidden'), false);
+  assert.equal(db.prepare("SELECT COUNT(*) c FROM users WHERE role = 'saygak'").get().c > 0, true);
+});
+
+test('statement sqmTotal uses the line unit snapshot, not the current service unit', async () => {
+  const { client } = await makePartner('Snapshot Unit', '+998906000006', 'snapUnit');
+  const o = seedDelivered(client.id, 1000, clampToday(D(1)), 4);
+  db.prepare("UPDATE order_lines SET unit = 'metr' WHERE docNum = ?").run(o);
+  const s = (await stmt(client.id, todayStr().slice(0, 7))).body;
+  assert.equal(s.orders.find((x) => x.docNum === o).sqmTotal, 0);
+});
