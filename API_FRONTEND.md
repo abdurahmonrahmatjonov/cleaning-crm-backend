@@ -245,13 +245,13 @@ For `kind: "partner"` orders `waybillNumber` and `deliveryTime` are optional (th
 Again, list every line once.
 ```json
 {
-  "deliveredDate": "2026-11-03",
+  "deliveredDate": "2026-10-03",
   "paid": 100000,
   "lines": [{ "id": 12, "sqm": 6.5 }]
 }
 ```
-- `deliveredDate` is optional and defaults to today.
-- `paid` is the money taken from the client now. It can be `0`.
+- `deliveredDate` is optional and defaults to today. It **cannot be in the future** (`400`, `details: { path: "deliveredDate" }`, nothing is written); past dates are fine.
+- `paid` is the money taken from the client now. It is **optional** and defaults to `0` for all orders (regular and saygak). It can be `0`.
 - The backend computes `docTotal` as the sum of `sqm x price` over the lines. `debt` is `max(docTotal - paid, 0)`.
 - **Partner orders** take no money at handover: `paid` and `discount` must be `0`/absent, otherwise `400`. The saygak pays later with a lump payment (see "Saygak clients"). The UI label for this step is "Topshirildi", the status string is still `Yetkazib berildi`.
 
@@ -374,7 +374,7 @@ Clients are also created automatically when an order is created (see `POST /clie
 
 A **saygak** is a partner client with special prices, its own login, no delivery address, and month-end lump payments instead of per-order payments. Staff flag a client with `PATCH /clients/:id { "isPartner": true }` (`clients.manage`). `isPartner` comes back as `0` or `1` from the client endpoints.
 
-Un-flagging (`isPartner: false`) is refused with `409` while the saygak has an active login ("Deactivate the saygak login first") or an unpaid delivered partner order ("Settle the saygak debt first"). A client with a login or saved prices cannot be deleted (`409`); deactivate the login instead.
+Un-flagging (`isPartner: false`) is refused with `409` while the saygak has an active login ("Deactivate the saygak login first") an unpaid delivered partner order ("Settle the saygak debt first"), or a partner order still in progress, i.e. received, picked up, washed or packed ("Finish or cancel the saygak orders in progress first"). A client with a login or saved prices cannot be deleted (`409`); deactivate the login instead.
 
 ### Prices and login (admin only, except GET prices)
 

@@ -534,7 +534,8 @@ test('staff create by name+phone detects an existing partner', async () => {
 const { today: todayStr } = await import('../src/utils/time.js');
 const MONTH = todayStr().slice(0, 7);
 const prevMonth = (() => { const [y, m] = MONTH.split('-').map(Number); return m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`; })();
-const D = (n) => `${MONTH}-${String(n).padStart(2, '0')}`;
+// never later than today, so a run on day 1-2 of a month stays valid under the future-date guards
+const D = (n) => { const d = `${MONTH}-${String(n).padStart(2, '0')}`; return d > todayStr() ? todayStr() : d; };
 
 // delivered partner order inserted directly: [docTotal, deliveredDate, kv.m sqm]
 const seedDelivered = (clientId, docTotal, deliveredDate, sqm = 0, kind = 'partner') => {
@@ -1039,3 +1040,24 @@ test('client detail: orders carry kind (regular before flagging, partner after)'
   assert.equal(kindOf(reg.body.docNum), 'regular');
   assert.equal(kindOf(par.body.docNum), 'partner');
 });
+
+// ---------- Final review fixes ----------
+const clampToday = (d) => (d > todayStr() ? todayStr() : d);
+const tomorrow = () => { const t = new Date(`${todayStr()}T00:00:00Z`); t.setUTCDate(t.getUTCDate() + 1); return t.toISOString().slice(0, 10); };
+
+test('deliver: future deliveredDate is rejected before any write; today and past are allowed', async () => {
+  const { client, token } = await makePartner('Deliver Future', '+998906000001', 'delFut');
+  const o = (await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).body;
+  const id = await staffWalk(o.docNum, 'pack');
+  const body = (deliveredDate) => ({ deliveredDate, lines: [{ id, sqm: 5 }] });
+  const bad = await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body: body(tomorrow()) });
+  assert.equal(bad.status, 400);
+  assert.equal(db.prepare('SELECT status, docTotal, deliveredDate FROM orders WHERE docNum = ?').get(o.docNum).status, 'Upakovka qilingan');
+  assert.equal(db.prepare('SELECT docTotal, deliveredDate FROM orders WHERE docNum = ?').get(o.docNum).docTotal, 0);
+  assert.equal(db.prepare('SELECT sqm FROM order_lines WHERE id = ?').get(id).sqm, 0);
+  const regular = await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body: body('2099-01-01') });
+  assert.equal(regular.status, 400);
+  assert.equal((await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body: body(todayStr()) })).status, 200);
+  assert.equal(debtOf(client.id), 30000);
+});
+

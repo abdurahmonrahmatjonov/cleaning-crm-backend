@@ -12,7 +12,6 @@ import { rememberAddress } from '../utils/addresses.js';
 import { PARTNER_OPEN_ORDER_CAP, priceMap } from '../utils/partner.js';
 import { loadSizes, normalizeSizes, replaceSizes, round2, sizeRow, sizesTotal } from '../utils/sizes.js';
 
-
 // ---------- request schemas ----------
 
 const clientNameField = z.string().trim().min(1).max(150);
@@ -456,6 +455,7 @@ export function orderRouter(db) {
     const b = req.valid.body;
 
     const deliveredDate = b.deliveredDate ?? today();
+    if (deliveredDate > today()) throw badRequest('deliveredDate cannot be in the future', { path: 'deliveredDate' });
     db.transaction(() => {
       const order = getOrder.get(docNum);
       if (!order) throw notFound('Order not found');
