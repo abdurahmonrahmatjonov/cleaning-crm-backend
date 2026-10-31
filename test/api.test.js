@@ -120,13 +120,13 @@ test('full order lifecycle', async () => {
   assert.ok((await call('GET', '/api/orders/packed', { token: driver })).body.data.some((x) => x.docNum === o.docNum));
 
   // deliver: docTotal = sum(sqm * price) = 6.5*15000 + 4*10000 = 137500
-  const del = await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: driver, body: { deliveredDate: '2026-11-03', paid: 100000, lines: [{ id: l1.id, sqm: 6.5 }, { id: l2.id, sqm: 4 }] } });
+  const del = await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: driver, body: { deliveredDate: '2026-10-03', paid: 100000, lines: [{ id: l1.id, sqm: 6.5 }, { id: l2.id, sqm: 4 }] } });
   assert.equal(del.status, 200);
   assert.equal(del.body.status, 'Yetkazib berildi');
   assert.equal(del.body.docTotal, 137500);
   assert.equal(del.body.paid, 100000);
   assert.equal(del.body.debt, 37500);
-  assert.equal(del.body.deliveredDate, '2026-11-03');
+  assert.equal(del.body.deliveredDate, '2026-10-03');
   assert.notEqual(del.body.deliveredAt, '');
   assert.deepEqual(del.body.lines.map((l) => l.lineTotal), [97500, 40000]);
 
@@ -211,7 +211,7 @@ test('clients, edit, cancel, debt payments, reports', async () => {
   const [l1, l2] = a.lines;
   await call('PATCH', `/api/orders/${a.docNum}/pickup`, { token: admin, body: { waybillNumber: 'N-9', deliveryTime: '2026-11-03 18:00', lines: [{ id: l1.id, quantity: 1 }, { id: l2.id, quantity: 1 }] } });
   await washAndPack(a.docNum);
-  const d = await call('PATCH', `/api/orders/${a.docNum}/deliver`, { token: admin, body: { deliveredDate: '2026-11-03', paid: 10000, lines: [{ id: l1.id, sqm: 2 }, { id: l2.id, sqm: 1 }] } });
+  const d = await call('PATCH', `/api/orders/${a.docNum}/deliver`, { token: admin, body: { deliveredDate: '2026-10-03', paid: 10000, lines: [{ id: l1.id, sqm: 2 }, { id: l2.id, sqm: 1 }] } });
   assert.equal(d.body.docTotal, 40000);
   assert.equal(d.body.deliveredBy, 'Administrator');
 
@@ -222,17 +222,17 @@ test('clients, edit, cancel, debt payments, reports', async () => {
   assert.ok(debtors.data.some((x) => x.clientId === a.clientId && x.debt === 30000));
 
   assert.equal((await call('POST', `/api/orders/${a.docNum}/payments`, { token: operator, body: { amount: 99999 } })).status, 400);
-  const pay = await call('POST', `/api/orders/${a.docNum}/payments`, { token: operator, body: { amount: 30000, paidDate: '2026-11-04' } });
+  const pay = await call('POST', `/api/orders/${a.docNum}/payments`, { token: operator, body: { amount: 30000, paidDate: '2026-10-04' } });
   assert.equal(pay.status, 201);
   assert.equal(pay.body.debt, 0);
   assert.equal((await call('GET', `/api/orders/${a.docNum}/payments`, { token: operator })).body.data.length, 2);
   assert.equal((await call('GET', `/api/clients/${a.clientId}`, { token: operator })).body.debt, 0);
 
   // reports
-  assert.equal((await call('GET', '/api/reports/summary?from=2026-11-01&to=2026-11-30', { token: operator })).status, 403);
-  const sum = (await call('GET', '/api/reports/summary?from=2026-11-04&to=2026-11-04', { token: admin })).body;
+  assert.equal((await call('GET', '/api/reports/summary?from=2026-10-01&to=2026-10-30', { token: operator })).status, 403);
+  const sum = (await call('GET', '/api/reports/summary?from=2026-10-04&to=2026-10-04', { token: admin })).body;
   assert.equal(sum.collected, 30000);
-  const sum2 = (await call('GET', '/api/reports/summary?from=2026-11-03&to=2026-11-03', { token: admin })).body;
+  const sum2 = (await call('GET', '/api/reports/summary?from=2026-10-03&to=2026-10-03', { token: admin })).body;
   assert.equal(sum2.sales.total >= 40000, true);
   assert.equal(sum2.sales.totalSqm >= 3, true);
 });
@@ -249,7 +249,7 @@ test('roles: permissions, custom roles, packer scope', async () => {
   // only admin manages roles
   assert.equal((await call('GET', '/api/roles', { token: operator })).status, 403);
   const list = await call('GET', '/api/roles', { token: admin });
-  assert.deepEqual(list.body.data.map((r) => r.key).sort(), ['admin', 'driver', 'operator', 'packer']);
+  assert.deepEqual(list.body.data.map((r) => r.key).sort(), ['admin', 'driver', 'operator', 'packer', 'saygak']);
   assert.equal((await call('PATCH', '/api/roles/admin', { token: admin, body: { permissions: [] } })).status, 409);
 
   // create a custom role, assign it, change its permissions live
@@ -477,7 +477,7 @@ test('discounts: at delivery and when paying later, permission-gated, debt every
 
   // a role without orders.discount can't give one (driver delivers, no discount permission)
   const a = await mk();
-  const deliverBody = { deliveredDate: '2026-11-03', paid: 0, lines: [{ id: a.l.id, sqm: 10 }] }; // total 100000
+  const deliverBody = { deliveredDate: '2026-10-03', paid: 0, lines: [{ id: a.l.id, sqm: 10 }] }; // total 100000
   assert.equal((await call('PATCH', `/api/orders/${a.o.docNum}/deliver`, { token: packer, body: { ...deliverBody, discount: 1000 } })).status, 403);
   assert.equal((await call('PATCH', `/api/orders/${a.o.docNum}/deliver`, { token: admin, body: { ...deliverBody, discount: 100001 } })).status, 400); // more than total
   const del = await call('PATCH', `/api/orders/${a.o.docNum}/deliver`, { token: admin, body: { ...deliverBody, paid: 60000, discount: 10000 } });
@@ -493,7 +493,7 @@ test('discounts: at delivery and when paying later, permission-gated, debt every
   // later payment with an extra discount: 30000 debt -> discount 5000 + pay 25000
   assert.equal((await call('POST', `/api/orders/${a.o.docNum}/payments`, { token: operator, body: { amount: 0, discount: 0 } })).status, 400);
   assert.equal((await call('POST', `/api/orders/${a.o.docNum}/payments`, { token: operator, body: { amount: 26000, discount: 5000 } })).status, 400); // too much
-  const pay = await call('POST', `/api/orders/${a.o.docNum}/payments`, { token: operator, body: { amount: 25000, discount: 5000, paidDate: '2026-11-04' } });
+  const pay = await call('POST', `/api/orders/${a.o.docNum}/payments`, { token: operator, body: { amount: 25000, discount: 5000, paidDate: '2026-10-04' } });
   assert.equal(pay.status, 201);
   assert.equal(pay.body.discount, 15000);
   assert.equal(pay.body.paid, 85000);
@@ -501,7 +501,7 @@ test('discounts: at delivery and when paying later, permission-gated, debt every
 
   // discount-only (no money) is allowed on a fresh debt
   const b = await mk();
-  await call('PATCH', `/api/orders/${b.o.docNum}/deliver`, { token: admin, body: { deliveredDate: '2026-11-03', paid: 0, lines: [{ id: b.l.id, sqm: 5 }] } });
+  await call('PATCH', `/api/orders/${b.o.docNum}/deliver`, { token: admin, body: { deliveredDate: '2026-10-03', paid: 0, lines: [{ id: b.l.id, sqm: 5 }] } });
   const only = await call('POST', `/api/orders/${b.o.docNum}/payments`, { token: operator, body: { discount: 20000 } });
   assert.equal(only.body.debt, 30000);
   assert.equal(only.body.paid, 0);

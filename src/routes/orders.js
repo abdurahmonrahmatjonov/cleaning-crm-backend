@@ -9,29 +9,33 @@ import { nowDateTime, today } from '../utils/time.js';
 import { diff, logActivity } from '../utils/activity.js';
 import { HttpError } from '../utils/httpError.js';
 import { rememberAddress } from '../utils/addresses.js';
-
-const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+import { PARTNER_OPEN_ORDER_CAP, priceMap } from '../utils/partner.js';
+import { loadSizes, normalizeSizes, replaceSizes, round2, sizeRow, sizesTotal } from '../utils/sizes.js';
 
 // ---------- request schemas ----------
 
 const clientNameField = z.string().trim().min(1).max(150);
+const locationField = z.object({
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+});
+const pickupTimeField = dateTimeString; // olib ketilish vaqti
 const createSchema = z
   .object({
   // Pick an existing client (their saved name/phone are used), or give a name and phone for a new one.
   clientId: idSchema.optional(),
   clientName: clientNameField.optional(),
   clientPhone: phoneString.optional(),
-  location: z.object({
-    latitude: z.number().min(-90).max(90),
-    longitude: z.number().min(-180).max(180),
-  }),
+  // Required for regular orders (checked in the handler); saygak orders have no address.
+  location: locationField.optional(),
   landmark: z.string().trim().max(300).default(''), // orientir
-  pickupTime: dateTimeString, // olib ketilish vaqti
+  pickupTime: pickupTimeField.optional(),
   lines: z
     .array(
       z.object({
         serviceId: idSchema,
-        price: money, // price per 1 kv.m
+        price: money.optional(), // price per 1 kv.m; required for regular orders, ignored for saygak clients
+        expectedQuantity: z.number().int().min(1).max(100000).optional(), // saygak: how many pieces they expect to bring
       }),
     )
     .min(1)
@@ -40,8 +44,8 @@ const createSchema = z
   .refine((o) => o.clientId || (o.clientName && o.clientPhone), 'Choose a client, or enter a name and phone number');
 
 const pickupSchema = z.object({
-  waybillNumber: z.string().trim().min(1).max(50), // nakladnoy
-  deliveryTime: dateTimeString, // yetkazilish vaqti
+  waybillNumber: z.string().trim().min(1).max(50).optional(), // nakladnoy (required for regular orders)
+  deliveryTime: dateTimeString.optional(), // yetkazilish vaqti (required for regular orders)
   lines: z
     .array(z.object({ id: idSchema, quantity: z.number().int().min(1).max(100000) }))
     .min(1),
@@ -49,12 +53,12 @@ const pickupSchema = z.object({
 
 // Washing and packing each re-count the pieces: every line of the order, exactly once.
 const countSchema = z.object({
-  lines: z.array(z.object({ id: idSchema, quantity: z.number().int().min(1).max(100000) })).min(1),
+  lines: z.array(z.object({ id: idSchema, quantity: z.number().int().min(1).max(100000), sizes: z.array(sizeRow).max(100).optional() })).min(1),
 });
 
 const deliverSchema = z.object({
   deliveredDate: dateString.optional(), // defaults to today
-  paid: money, // mijozdan olingan summa
+  paid: money.default(0), // mijozdan olingan summa
   discount: money.optional(), // chegirma (needs the orders.discount permission)
   // `sqm` is the measured amount in the line's unit (kv.m or metr). Not needed for per-piece (dona) lines.
   lines: z.array(z.object({ id: idSchema, sqm: z.number().positive().max(1e6).optional() })).min(1),
@@ -64,9 +68,9 @@ const editSchema = z
   .object({
     clientName: clientNameField,
     clientPhone: phoneString,
-    location: createSchema.shape.location,
+    location: locationField,
     landmark: createSchema.shape.landmark.unwrap(),
-    pickupTime: createSchema.shape.pickupTime,
+    pickupTime: pickupTimeField,
   })
   .partial()
   .refine((o) => Object.keys(o).length > 0, 'Nothing to update');
@@ -85,6 +89,54 @@ const listQuery = pagination.extend({ search: z.string().trim().max(100).optiona
 const params = z.object({ docNum: idSchema });
 
 // ---------- helpers ----------
+
+/**
+ * Create a saygak (partner) order: prices come from client_prices, no address, no pickup time.
+ * `user` is the staff member or the saygak's own user row. The open-order cap is checked in the same transaction as the insert.
+ * Returns the new docNum.
+ */
+export function createPartnerOrder(db, user, client, { lines, via = 'partner' }) {
+  return db.transaction(() => {
+    if (!client?.isPartner) throw badRequest('Client is not a saygak');
+    const open = db
+      .prepare("SELECT COUNT(*) c FROM orders WHERE kind = 'partner' AND clientId = ? AND status = ?")
+      .get(client.id, ORDER_STATUS.RECEIVED).c;
+    if (open >= PARTNER_OPEN_ORDER_CAP) {
+      throw conflict(`Saygak already has ${PARTNER_OPEN_ORDER_CAP} open orders; wait until some are picked up`);
+    }
+    const prices = priceMap(db, client.id);
+    const getSvc = db.prepare('SELECT id, name, unit FROM services WHERE id = ? AND isActive = 1');
+    const resolved = lines.map((l, i) => {
+      const svc = getSvc.get(l.serviceId);
+      if (!svc) throw badRequest('Unknown or inactive service', { path: `lines.${i}.serviceId` });
+      const price = prices.get(l.serviceId);
+      if (price === undefined) throw badRequest('No price set for this service', { path: `lines.${i}.serviceId` });
+      return { serviceId: svc.id, serviceName: svc.name, unit: svc.unit, price, expectedQuantity: l.expectedQuantity ?? 0 };
+    });
+    const now = nowDateTime();
+    const info = db
+      .prepare(
+        `INSERT INTO orders (kind, status, clientId, clientName, clientPhone, latitude, longitude, landmark, pickupPlannedAt,
+                             createdById, createdByName, createdAt, orderTakenAt)
+         VALUES ('partner', ?, ?, ?, ?, 0, 0, '', ?, ?, ?, ?, ?)`,
+      )
+      .run(ORDER_STATUS.RECEIVED, client.id, client.name, client.phone, now, user.id, user.fullName, today(), now);
+    const insertLine = db.prepare(
+      `INSERT INTO order_lines (docNum, serviceId, serviceName, unit, price, customerPrice, expectedQuantity) VALUES (?,?,?,?,?,?,?)`,
+    );
+    for (const l of resolved) insertLine.run(info.lastInsertRowid, l.serviceId, l.serviceName, l.unit, l.price, l.price, l.expectedQuantity);
+    logActivity(db, user, 'order', info.lastInsertRowid, 'order.created', {
+      client: client.name,
+      phone: client.phone,
+      clientId: client.id,
+      partner: true,
+      via,
+      prices: resolved.map((l) => ({ serviceId: l.serviceId, price: l.price })),
+      services: resolved.map((l) => `${l.serviceName} (${l.price}/${l.unit})`),
+    });
+    return info.lastInsertRowid;
+  })();
+}
 
 export function orderRouter(db) {
   const router = Router();
@@ -115,8 +167,9 @@ export function orderRouter(db) {
 
   const getService = db.prepare('SELECT id, name, unit FROM services WHERE id = ? AND isActive = 1');
 
-  const presentLine = (l) => ({
+  const presentLine = (l, sizes = []) => ({
     id: l.id,
+    expectedQuantity: l.expectedQuantity,
     serviceId: l.serviceId,
     serviceName: l.serviceName,
     status: l.status,
@@ -129,10 +182,13 @@ export function orderRouter(db) {
     sqm: l.sqm,
     lineTotal: l.lineTotal,
     currency: l.currency,
+    sizes,
+    sizesTotal: sizesTotal(sizes),
   });
 
-  const presentOrder = (o, lines) => ({
+  const presentOrder = (o, lines, sizeMap = new Map()) => ({
     docNum: o.docNum,
+    kind: o.kind,
     status: o.status,
     docStatus: o.docStatus,
     clientId: o.clientId,
@@ -162,12 +218,12 @@ export function orderRouter(db) {
     deliveredBy: o.deliveredByName,
     cancelReason: o.cancelReason,
     cancelledAt: o.cancelledAt,
-    lines: lines.map(presentLine),
+    lines: lines.map((l) => presentLine(l, sizeMap.get(l.id) ?? [])),
   });
 
   const loadOrder = (docNum) => {
     const o = getOrder.get(docNum);
-    return o ? presentOrder(o, getLines.all(docNum)) : null;
+    return o ? presentOrder(o, getLines.all(docNum), loadSizes(db, [docNum])) : null;
   };
 
   /** Make sure `given` ids are exactly the order's line ids: no missing, extra or duplicate. */
@@ -209,8 +265,9 @@ export function orderRouter(db) {
         byDoc.get(l.docNum).push(l);
       }
     }
+    const sizeMap = loadSizes(db, orders.map((o) => o.docNum));
     res.json({
-      data: orders.map((o) => presentOrder(o, byDoc.get(o.docNum))),
+      data: orders.map((o) => presentOrder(o, byDoc.get(o.docNum), sizeMap)),
       meta: { page, limit, total },
     });
   };
@@ -224,21 +281,31 @@ export function orderRouter(db) {
     const now = nowDateTime();
 
     const docNum = db.transaction(() => {
-      // resolve services first so a bad id fails the whole request
+      let client;
+      if (b.clientId) {
+        client = db.prepare('SELECT * FROM clients WHERE id = ?').get(b.clientId);
+        if (!client) throw badRequest('Unknown client', { path: 'clientId' });
+      } else {
+        const id = clientIdFor(b.clientName, b.clientPhone, req.user);
+        client = db.prepare('SELECT * FROM clients WHERE id = ?').get(id);
+      }
+      // the server decides the kind from the client; typed prices are ignored for saygak clients
+      if (client.isPartner) {
+        return createPartnerOrder(db, req.user, client, { lines: b.lines, via: 'staff' });
+      }
+
+      if (!b.location) throw badRequest('Location is required', { path: 'location' });
+      if (!b.pickupTime) throw badRequest('Pickup time is required', { path: 'pickupTime' });
       const lines = b.lines.map((l, i) => {
         const svc = getService.get(l.serviceId);
         if (!svc) throw badRequest(`Unknown or inactive service`, { path: `lines.${i}.serviceId` });
+        if (l.price === undefined) throw badRequest('Price is required', { path: `lines.${i}.price` });
         return { ...l, serviceName: svc.name, unit: svc.unit };
       });
-      let clientId, clientName, clientPhone;
-      if (b.clientId) {
-        const c = db.prepare('SELECT * FROM clients WHERE id = ?').get(b.clientId);
-        if (!c) throw badRequest('Unknown client', { path: 'clientId' });
-        ({ id: clientId, name: clientName, phone: clientPhone } = c);
-      } else {
-        ({ clientName, clientPhone } = b);
-        clientId = clientIdFor(clientName, clientPhone, req.user);
-      }
+      // a typed name/phone is kept on the order as typed (the client record keeps its own)
+      const clientId = client.id;
+      const clientName = b.clientId ? client.name : b.clientName;
+      const clientPhone = b.clientId ? client.phone : b.clientPhone;
       rememberAddress(db, clientId, b.location, b.landmark);
       const info = db
         .prepare(
@@ -288,15 +355,20 @@ export function orderRouter(db) {
       if (order.status !== ORDER_STATUS.RECEIVED) {
         throw conflict(`Order is "${order.status}", expected "${ORDER_STATUS.RECEIVED}"`);
       }
+      if (order.kind !== 'partner' && (!b.waybillNumber || !b.deliveryTime)) {
+        throw badRequest('waybillNumber and deliveryTime are required', { path: b.waybillNumber ? 'deliveryTime' : 'waybillNumber' });
+      }
+      const waybill = b.waybillNumber ?? '';
+      const planned = b.deliveryTime ?? '';
       assertAllLines(docNum, b.lines);
       const setQty = db.prepare('UPDATE order_lines SET quantity = ?, pickedQuantity = ? WHERE id = ? AND docNum = ?');
       for (const l of b.lines) setQty.run(l.quantity, l.quantity, l.id, docNum);
       db.prepare(
         `UPDATE orders SET status = ?, waybillNumber = ?, deliveryTime = ?, pickedUpAt = ?,
                            pickedUpById = ?, pickedUpByName = ? WHERE docNum = ?`,
-      ).run(ORDER_STATUS.PICKED_UP, b.waybillNumber, b.deliveryTime, nowDateTime(), req.user.id, req.user.fullName, docNum);
+      ).run(ORDER_STATUS.PICKED_UP, waybill, planned, nowDateTime(), req.user.id, req.user.fullName, docNum);
       logActivity(db, req.user, 'order', docNum, 'order.pickedup', {
-        from: order.status, to: ORDER_STATUS.PICKED_UP, waybill: b.waybillNumber, deliveryTime: b.deliveryTime,
+        from: order.status, to: ORDER_STATUS.PICKED_UP, waybill, deliveryTime: planned,
         quantities: b.lines.length ? b.lines.map((l) => l.quantity) : [],
       });
     })();
@@ -327,7 +399,16 @@ export function orderRouter(db) {
       assertAllLines(docNum, b.lines);
       const before = new Map(getLines.all(docNum).map((l) => [l.id, l]));
       const set = db.prepare(`UPDATE order_lines SET ${column} = ? WHERE id = ? AND docNum = ?`);
-      for (const l of b.lines) set.run(l.quantity, l.id, docNum);
+      const oldSizes = loadSizes(db, [docNum]);
+      const sizeLog = new Map();
+      for (const l of b.lines) {
+        set.run(l.quantity, l.id, docNum);
+        if (l.sizes === undefined) continue;
+        if (before.get(l.id).unit !== 'kv.m') throw badRequest('Sizes are only for kv.m services', { lineId: l.id });
+        const rows = normalizeSizes(l.sizes);
+        sizeLog.set(l.id, { from: oldSizes.get(l.id) ?? [], to: rows });
+        replaceSizes(db, l.id, rows);
+      }
       db.prepare(`UPDATE orders SET status = ?, ${cols.at} = ?, ${cols.byId} = ?, ${cols.byName} = ? WHERE docNum = ?`).run(
         to,
         nowDateTime(),
@@ -340,9 +421,11 @@ export function orderRouter(db) {
         to,
         counts: b.lines.map((l) => {
           const old = before.get(l.id);
-          return column === 'quantity'
+          const entry = column === 'quantity'
             ? { service: old.serviceName, picked: old.pickedQuantity, washed: old.washedQuantity, packed: l.quantity }
             : { service: old.serviceName, picked: old.pickedQuantity, washed: l.quantity };
+          if (sizeLog.has(l.id)) entry.sizes = sizeLog.get(l.id);
+          return entry;
         }),
       });
     })();
@@ -372,6 +455,7 @@ export function orderRouter(db) {
     const b = req.valid.body;
 
     const deliveredDate = b.deliveredDate ?? today();
+    if (deliveredDate > today()) throw badRequest('deliveredDate cannot be in the future', { path: 'deliveredDate' });
     db.transaction(() => {
       const order = getOrder.get(docNum);
       if (!order) throw notFound('Order not found');
@@ -380,6 +464,9 @@ export function orderRouter(db) {
       }
       assertAllLines(docNum, b.lines);
       const discount = b.discount ?? 0;
+      if (order.kind === 'partner' && (b.paid > 0 || discount > 0)) {
+        throw badRequest('Saygak orders take no money at handover', { path: b.paid > 0 ? 'paid' : 'discount' });
+      }
       if (discount > 0) needDiscountPerm(req.user);
 
       const existing = new Map(getLines.all(docNum).map((l) => [l.id, l]));
@@ -387,6 +474,8 @@ export function orderRouter(db) {
         `UPDATE order_lines SET sqm = ?, lineTotal = ?, status = 'Closed' WHERE id = ? AND docNum = ?`,
       );
       let docTotal = 0;
+      const sizeMap = loadSizes(db, [docNum]);
+      const logLines = [];
       for (const l of b.lines) {
         const line = existing.get(l.id);
         // per-piece lines are charged by the counted pieces; the others need a measured amount
@@ -395,6 +484,7 @@ export function orderRouter(db) {
         const lineTotal = round2(amount * line.price);
         docTotal += lineTotal;
         setLine.run(amount, lineTotal, l.id, docNum);
+        if (line.unit === 'kv.m') logLines.push({ service: line.serviceName, sizesTotal: sizesTotal(sizeMap.get(l.id) ?? []), sqm: amount });
       }
       if (discount > round2(docTotal)) throw badRequest('Discount cannot be more than the order total');
       db.prepare(
@@ -412,10 +502,10 @@ export function orderRouter(db) {
         req.user.fullName,
         docNum,
       );
-      if (b.paid > 0) insertPayment(docNum, b.paid, deliveredDate, req.user, discount);
+      if (b.paid > 0 && order.kind !== 'partner') insertPayment(docNum, b.paid, deliveredDate, req.user, discount);
       logActivity(db, req.user, 'order', docNum, 'order.delivered', {
         from: order.status, to: ORDER_STATUS.DELIVERED, docTotal: round2(docTotal), discount, paid: b.paid,
-        debt: Math.max(round2(docTotal - discount - b.paid), 0), deliveredDate,
+        debt: Math.max(round2(docTotal - discount - b.paid), 0), deliveredDate, lines: logLines,
       });
     })();
 
@@ -440,6 +530,9 @@ export function orderRouter(db) {
       if (order.status !== ORDER_STATUS.RECEIVED) {
         throw conflict(`Only "${ORDER_STATUS.RECEIVED}" orders can be edited`);
       }
+      if (order.kind === 'partner' && ['clientName', 'clientPhone', 'landmark', 'location'].some((k) => b[k] !== undefined)) {
+        throw conflict('Saygak orders are edited on the client page');
+      }
       const name = b.clientName ?? order.clientName;
       const phone = b.clientPhone ?? order.clientPhone;
       const next = {
@@ -451,6 +544,9 @@ export function orderRouter(db) {
         changes: diff(order, next, ['clientName', 'clientPhone', 'latitude', 'longitude', 'landmark', 'pickupPlannedAt']),
       });
       const clientId = clientIdFor(name, phone, req.user);
+      if (order.kind !== 'partner' && db.prepare('SELECT isPartner FROM clients WHERE id = ?').get(clientId)?.isPartner) {
+        throw conflict('This phone belongs to a saygak; create a saygak order instead');
+      }
       if (b.location) rememberAddress(db, clientId, b.location, b.landmark ?? order.landmark);
       db.prepare(
         `UPDATE orders SET clientId = ?, clientName = ?, clientPhone = ?, latitude = ?, longitude = ?,
@@ -493,6 +589,7 @@ export function orderRouter(db) {
     db.transaction(() => {
       const order = getOrder.get(docNum);
       if (!order) throw notFound('Order not found');
+      if (order.kind === 'partner') throw conflict('Saygak orders are paid from the client page');
       if (order.status !== ORDER_STATUS.DELIVERED) throw conflict('Payments are only for delivered orders');
       if (discount > 0) needDiscountPerm(req.user);
       const debt = round2(order.docTotal - order.discount - order.paid);

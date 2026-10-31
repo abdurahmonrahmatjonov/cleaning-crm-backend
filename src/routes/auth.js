@@ -31,13 +31,13 @@ export function authRouter(db, { loginLimit = 10 } = {}) {
     if (!user || !user.isActive || !ok) throw new HttpError(401, 'Wrong username or password');
     res.json({
       token: signToken(user),
-      user: { id: user.id, username: user.username, fullName: user.fullName, role: user.role, roleName: findRole.get(user.role)?.name ?? user.role, permissions: permissionsOf(findRole, user.role) },
+      user: { id: user.id, username: user.username, fullName: user.fullName, role: user.role, roleName: findRole.get(user.role)?.name ?? user.role, permissions: permissionsOf(findRole, user.role), clientId: user.clientId ?? null },
     });
   });
 
   router.get('/me', authenticate(db), (req, res) => {
-    const { id, username, fullName, role, permissions } = req.user;
-    res.json({ id, username, fullName, role, roleName: findRole.get(role)?.name ?? role, permissions });
+    const { id, username, fullName, role, permissions, clientId } = req.user;
+    res.json({ id, username, fullName, role, roleName: findRole.get(role)?.name ?? role, permissions, clientId });
   });
 
   return router;

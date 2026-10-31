@@ -18,7 +18,7 @@ export const signToken = (user) =>
 
 /** Verifies the Bearer token and loads the (still active) user from the DB on every request. */
 export const authenticate = (db) => {
-  const findUser = db.prepare('SELECT id, username, fullName, role, isActive FROM users WHERE id = ?');
+  const findUser = db.prepare('SELECT id, username, fullName, role, isActive, clientId FROM users WHERE id = ?');
   const findRole = db.prepare('SELECT permissions FROM roles WHERE key = ?');
   return (req, _res, next) => {
     const header = req.headers.authorization || '';
@@ -28,7 +28,7 @@ export const authenticate = (db) => {
       const payload = jwt.verify(token, config.jwtSecret);
       const user = findUser.get(payload.sub);
       if (!user || !user.isActive) return next(new HttpError(401, 'Invalid or disabled user'));
-      req.user = { ...user, permissions: permissionsOf(findRole, user.role) };
+      req.user = { ...user, permissions: permissionsOf(findRole, user.role), clientId: user.clientId ?? null };
       next();
     } catch {
       next(new HttpError(401, 'Invalid or expired token'));
@@ -42,3 +42,13 @@ export const requireRole = (...roles) => (req, _res, next) =>
 /** Allow if the user has at least one of these permissions. */
 export const requirePerm = (...perms) => (req, _res, next) =>
   perms.some((p) => req.user.permissions.includes(p)) ? next() : next(new HttpError(403, 'Forbidden for your role'));
+
+/** Deny-by-default: any account tied to a client (saygak) is barred from staff routes. */
+export const partnerGate = (req, _res, next) =>
+  req.user?.clientId != null ? next(new HttpError(403, 'Forbidden for your role')) : next();
+
+/** The partner API is only for accounts tied to a client (a positive integer id; anything else fails closed). */
+export const requirePartner = (req, _res, next) =>
+  Number.isInteger(req.user?.clientId) && req.user.clientId > 0
+    ? next()
+    : next(new HttpError(403, 'Forbidden for your role'));
