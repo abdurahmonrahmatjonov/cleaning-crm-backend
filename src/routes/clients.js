@@ -5,12 +5,11 @@ import { validate } from '../middleware/validate.js';
 import bcrypt from 'bcryptjs';
 import { requirePerm, requireRole } from '../middleware/auth.js';
 import { ORDER_STATUS } from '../db.js';
-import { badRequest, conflict, notFound } from '../utils/httpError.js';
+import { badRequest, conflict, HttpError, notFound } from '../utils/httpError.js';
 import { dateString, id as idSchema, money, pagination, phoneString } from '../utils/schemas.js';
 import { diff, logActivity } from '../utils/activity.js';
 import { presentAddress, rememberAddress } from '../utils/addresses.js';
 import { nowDateTime, today } from '../utils/time.js';
-import { HttpError } from '../utils/httpError.js';
 import { round2 } from '../utils/sizes.js';
 import { buildStatement, MONTH_RE } from '../utils/statement.js';
 
@@ -142,6 +141,10 @@ export function clientsRouter(db) {
         .all(id, ORDER_STATUS.DELIVERED)
         .some((o) => round2(o.docTotal - o.discount - o.paid) > 0);
       if (owing) throw conflict('Settle the saygak debt first');
+      const inProgress = db
+        .prepare(`SELECT 1 FROM orders WHERE clientId = ? AND kind = 'partner' AND status IN (?,?,?,?)`)
+        .get(id, ORDER_STATUS.RECEIVED, ORDER_STATUS.PICKED_UP, ORDER_STATUS.WASHED, ORDER_STATUS.PACKED);
+      if (inProgress) throw conflict('Finish or cancel the saygak orders in progress first');
     }
     const next = { name: b.name ?? before.name, phone: b.phone ?? before.phone, isPartner: b.isPartner === undefined ? before.isPartner : b.isPartner ? 1 : 0 };
     try {
@@ -229,7 +232,8 @@ export function clientsRouter(db) {
 
   router.patch('/:id/login', adminOnly, validate(params, 'params'), validate(loginPatchSchema), (req, res) => {
     const { id } = req.valid.params;
-    getClient(id);
+    if (req.valid.body.isActive) getPartner(id);
+    else getClient(id);
     const u = db.prepare('SELECT id, username FROM users WHERE clientId = ?').get(id);
     if (!u) throw notFound('This client has no login');
     db.prepare('UPDATE users SET isActive = ? WHERE id = ?').run(req.valid.body.isActive ? 1 : 0, u.id);

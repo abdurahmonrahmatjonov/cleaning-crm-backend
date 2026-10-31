@@ -1061,3 +1061,42 @@ test('deliver: future deliveredDate is rejected before any write; today and past
   assert.equal(debtOf(client.id), 30000);
 });
 
+test('un-flag is blocked while a saygak order is in progress', async () => {
+  const { client, token } = await makePartner('Unflag Progress', '+998906000002', 'unflagProg');
+  const o = (await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).body;
+  assert.equal((await call('PATCH', `/api/clients/${client.id}/login`, { token: admin, body: { isActive: false } })).status, 200);
+  const unflag = () => call('PATCH', `/api/clients/${client.id}`, { token: operator, body: { isPartner: false } });
+  assert.equal((await unflag()).status, 409); // RECEIVED
+  const id = await staffWalk(o.docNum, 'pickup');
+  assert.equal((await unflag()).status, 409); // PICKED_UP
+  await call('PATCH', `/api/orders/${o.docNum}/wash`, { token: packer, body: { lines: [{ id, quantity: 2 }] } });
+  assert.equal((await unflag()).status, 409); // WASHED
+  await call('PATCH', `/api/orders/${o.docNum}/pack`, { token: packer, body: { lines: [{ id, quantity: 2 }] } });
+  assert.equal((await unflag()).status, 409); // PACKED
+  assert.equal(db.prepare('SELECT isPartner FROM clients WHERE id = ?').get(client.id).isPartner, 1);
+  assert.equal((await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body: { lines: [{ id, sqm: 10 }] } })).status, 200);
+  assert.equal((await unflag()).status, 409); // now owes
+  assert.equal((await pay(client.id, { amount: 60000 })).status, 201);
+  assert.equal((await unflag()).status, 200);
+});
+
+test('un-flag is allowed after an in-progress saygak order is cancelled', async () => {
+  const { client, token } = await makePartner('Unflag Cancel', '+998906000003', 'unflagCan');
+  const o = (await P('POST', '/orders', token, { lines: [{ serviceId: 1 }] })).body;
+  assert.equal((await call('PATCH', `/api/clients/${client.id}/login`, { token: admin, body: { isActive: false } })).status, 200);
+  const unflag = () => call('PATCH', `/api/clients/${client.id}`, { token: operator, body: { isPartner: false } });
+  assert.equal((await unflag()).status, 409);
+  assert.equal((await call('POST', `/api/orders/${o.docNum}/cancel`, { token: admin, body: { reason: 'test' } })).status, 200);
+  assert.equal((await unflag()).status, 200);
+});
+
+test('login can only be reactivated for a current saygak', async () => {
+  const { client } = await makePartner('Reactivate', '+998906000004', 'reactP');
+  const login = (isActive) => call('PATCH', `/api/clients/${client.id}/login`, { token: admin, body: { isActive } });
+  assert.equal((await login(false)).status, 200);
+  assert.equal((await call('PATCH', `/api/clients/${client.id}`, { token: operator, body: { isPartner: false } })).status, 200);
+  assert.equal((await login(true)).status, 409);
+  assert.equal(db.prepare('SELECT isActive FROM users WHERE clientId = ?').get(client.id).isActive, 0);
+  assert.equal((await login(false)).status, 200); // deactivation stays allowed
+});
+
