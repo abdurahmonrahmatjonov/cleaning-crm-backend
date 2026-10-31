@@ -534,8 +534,7 @@ test('staff create by name+phone detects an existing partner', async () => {
 const { today: todayStr } = await import('../src/utils/time.js');
 const MONTH = todayStr().slice(0, 7);
 const prevMonth = (() => { const [y, m] = MONTH.split('-').map(Number); return m === 1 ? `${y - 1}-12` : `${y}-${String(m - 1).padStart(2, '0')}`; })();
-// never later than today, so a run on day 1-2 of a month stays valid under the future-date guards
-const D = (n) => { const d = `${MONTH}-${String(n).padStart(2, '0')}`; return d > todayStr() ? todayStr() : d; };
+const D = (n) => `${MONTH}-${String(n).padStart(2, '0')}`;
 
 // delivered partner order inserted directly: [docTotal, deliveredDate, kv.m sqm]
 const seedDelivered = (clientId, docTotal, deliveredDate, sqm = 0, kind = 'partner') => {
@@ -1042,7 +1041,6 @@ test('client detail: orders carry kind (regular before flagging, partner after)'
 });
 
 // ---------- Final review fixes ----------
-const clampToday = (d) => (d > todayStr() ? todayStr() : d);
 const tomorrow = () => { const t = new Date(`${todayStr()}T00:00:00Z`); t.setUTCDate(t.getUTCDate() + 1); return t.toISOString().slice(0, 10); };
 
 test('deliver: future deliveredDate is rejected before any write; today and past are allowed', async () => {
@@ -1055,8 +1053,8 @@ test('deliver: future deliveredDate is rejected before any write; today and past
   assert.equal(db.prepare('SELECT status, docTotal, deliveredDate FROM orders WHERE docNum = ?').get(o.docNum).status, 'Upakovka qilingan');
   assert.equal(db.prepare('SELECT docTotal, deliveredDate FROM orders WHERE docNum = ?').get(o.docNum).docTotal, 0);
   assert.equal(db.prepare('SELECT sqm FROM order_lines WHERE id = ?').get(id).sqm, 0);
-  const regular = await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body: body('2099-01-01') });
-  assert.equal(regular.status, 400);
+  const farFuture = await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body: body('2099-01-01') });
+  assert.equal(farFuture.status, 400);
   assert.equal((await call('PATCH', `/api/orders/${o.docNum}/deliver`, { token: admin, body: body(todayStr()) })).status, 200);
   assert.equal(debtOf(client.id), 30000);
 });
@@ -1110,7 +1108,7 @@ test('staff chat user list does not include saygak logins', async () => {
 
 test('statement sqmTotal uses the line unit snapshot, not the current service unit', async () => {
   const { client } = await makePartner('Snapshot Unit', '+998906000006', 'snapUnit');
-  const o = seedDelivered(client.id, 1000, clampToday(D(1)), 4);
+  const o = seedDelivered(client.id, 1000, D(1), 4);
   db.prepare("UPDATE order_lines SET unit = 'metr' WHERE docNum = ?").run(o);
   const s = (await stmt(client.id, todayStr().slice(0, 7))).body;
   assert.equal(s.orders.find((x) => x.docNum === o).sqmTotal, 0);

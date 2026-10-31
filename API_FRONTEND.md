@@ -374,7 +374,7 @@ Clients are also created automatically when an order is created (see `POST /clie
 
 A **saygak** is a partner client with special prices, its own login, no delivery address, and month-end lump payments instead of per-order payments. Staff flag a client with `PATCH /clients/:id { "isPartner": true }` (`clients.manage`). `isPartner` comes back as `0` or `1` from the client endpoints.
 
-Un-flagging (`isPartner: false`) is refused with `409` while the saygak has an active login ("Deactivate the saygak login first") an unpaid delivered partner order ("Settle the saygak debt first"), or a partner order still in progress, i.e. received, picked up, washed or packed ("Finish or cancel the saygak orders in progress first"). A client with a login or saved prices cannot be deleted (`409`); deactivate the login instead.
+Un-flagging (`isPartner: false`) is refused with `409` while the saygak has an active login ("Deactivate the saygak login first"), an unpaid delivered partner order ("Settle the saygak debt first"), or a partner order still in progress, i.e. received, picked up, washed or packed ("Finish or cancel the saygak orders in progress first"). A client with a login or saved prices cannot be deleted (`409`); deactivate the login instead.
 
 ### Prices and login (admin only, except GET prices)
 
